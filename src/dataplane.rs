@@ -5,18 +5,18 @@
 //! this module plays that connector role, wire-compatibly with the llm-d routing
 //! sidecar and a real vLLM peer:
 //!
-//!   - PREFILL registers a (fake) KV region with NIXL and advertises how to reach it
-//!     as [`RemoteKv`] (`remote_engine_id` / `remote_host` / `remote_port` /
-//!     `remote_block_ids`). The engine wraps that into the real `kv_transfer_params`
-//!     dict the sidecar relays.
-//!   - DECODE receives that addressing, fetches the prefill agent's NIXL metadata over
-//!     a ZMQ side channel, and posts a NIXL READ to pull the blocks before generating.
+//!   - PREFILL registers a (fake) KV region with NIXL, runs a NIXL listener thread, and
+//!     advertises how to reach it as [`RemoteKv`] (`remote_engine_id` / `remote_host` /
+//!     `remote_port` / `remote_block_ids`). The engine wraps that into the real
+//!     `kv_transfer_params` dict the sidecar relays.
+//!   - DECODE fetches the prefill agent's NIXL metadata from its listener (host:port),
+//!     polls until it loads, then posts a NIXL READ to pull the bytes before generating.
 //!
 //! ```text
 //!   prefill engine                            decode engine
 //!   ┌────────────────────┐   kv_transfer_     ┌────────────────────┐
-//!   │ register KV w/ NIXL │   params dict      │ fetch md (ZMQ),     │
-//!   │ serve md (ZMQ)      │   {remote_host,    │ add_remote_agent,   │
+//!   │ register KV w/ NIXL │   params dict      │ fetch_remote_md     │
+//!   │ NIXL listener :port │   {remote_host,    │ (host:port), poll,  │
 //!   │ advertise RemoteKv ─┼─  port,engine_id, ─┼▶ NIXL READ, verify  │
 //!   └────────────────────┘    block_ids}       └────────────────────┘
 //! ```
@@ -52,8 +52,11 @@ pub struct NixlConfig {
     pub side_channel_port: u32,
 }
 
-/// How a decode peer reaches a prefilled request's KV. These are exactly the
-/// `remote_*` fields of vLLM's `kv_transfer_params`.
+/// How a decode peer reaches a prefilled request's KV. `engine_id`/`host`/`port`/
+/// `block_ids` are the wire-faithful `remote_*` fields of vLLM's `kv_transfer_params`;
+/// `addr`/`len`/`pattern` are a mock extension (real vLLM carries the base address in the
+/// NixlAgentMetadata over its own channel, we piggyback it so two mock peers interoperate
+/// through the real sidecar without reimplementing that channel).
 #[derive(Debug, Clone)]
 pub struct RemoteKv {
     pub engine_id: String,
@@ -61,6 +64,12 @@ pub struct RemoteKv {
     pub port: u32,
     /// Logical KV block ids on the prefill side to read.
     pub block_ids: Vec<i64>,
+    /// Base address of the prefill's registered KV buffer.
+    pub addr: u64,
+    /// Length of that buffer in bytes.
+    pub len: u64,
+    /// Fill byte, for the decode side to verify the pull moved the right bytes.
+    pub pattern: u8,
 }
 
 /// The minimal view of a request the data plane needs, decoupled from the wire
@@ -111,6 +120,9 @@ impl KvDataPlane for NoopDataPlane {
             host: self.cfg.side_channel_host.clone(),
             port: self.cfg.side_channel_port,
             block_ids: self.block_ids(kv.num_tokens),
+            addr: 0,
+            len: 0,
+            pattern: 0,
         })
     }
 
@@ -161,10 +173,10 @@ mod nixl {
 
     use anyhow::{Result, anyhow, bail};
     use nixl_sys::{
-        Agent, Backend, MemType, MemoryRegion as _, NixlError, NixlRegistration as _, OptArgs,
-        SystemStorage, XferDescList, XferOp, is_stub,
+        Agent, AgentConfig, Backend, MemType, MemoryRegion as _, NixlError, NixlRegistration as _,
+        OptArgs, SystemStorage, XferDescList, XferOp, is_stub,
     };
-    use tracing::{debug, warn};
+    use tracing::debug;
 
     use super::{KvDataPlane, NixlConfig, PdRole, RemoteKv, RequestKv};
 
@@ -176,34 +188,35 @@ mod nixl {
         anyhow!("nixl: {error:?}")
     }
 
-    /// A registered KV buffer awaiting a pull, plus what a peer needs to read it.
-    struct StagedKv {
-        /// Liveness anchor: keeps the registered buffer alive at `addr` until release.
-        #[allow(dead_code)]
-        storage: SystemStorage,
-        addr: u64,
-        len: u64,
-        pattern: u8,
-    }
-
     pub struct NixlDataPlane {
         role: PdRole,
         cfg: NixlConfig,
         /// NIXL agent name == engine id, so a peer's `remote_engine_id` is the agent name.
         agent: Agent,
         backend: Backend,
-        /// Prefill side: registered KV buffers awaiting a pull, keyed by request id.
-        staged: HashMap<String, StagedKv>,
+        /// Prefill side: registered KV buffers kept alive (and registered) at their
+        /// advertised address until `release`d, keyed by request id.
+        staged: HashMap<String, SystemStorage>,
     }
 
     impl NixlDataPlane {
         pub fn new(role: PdRole, cfg: NixlConfig) -> Result<Self> {
-            let agent = Agent::new(&cfg.engine_id).map_err(ne)?;
+            // Both agents run the listener + prog threads (as in NIXL's basic_two_peers):
+            // prefill serves its metadata, decode fetches it asynchronously and needs the
+            // prog thread to process the response. Each listens on its own side-channel port.
+            let acfg = AgentConfig {
+                enable_prog_thread: true,
+                enable_listen_thread: true,
+                listen_port: cfg.side_channel_port as i32,
+                ..AgentConfig::default()
+            };
+            let agent = Agent::new_configured(&cfg.engine_id, &acfg).map_err(ne)?;
             let (_, params) = agent.get_plugin_params("UCX").map_err(ne)?;
             let backend = agent.create_backend("UCX", &params).map_err(ne)?;
             debug!(
                 engine_id = cfg.engine_id,
                 ?role,
+                listen_port = cfg.side_channel_port,
                 "NIXL data plane ready (UCX backend)"
             );
             Ok(Self {
@@ -235,15 +248,7 @@ mod nixl {
             // move into `staged` (moving the Vec header does not reallocate).
             let addr = unsafe { storage.as_ptr() as u64 };
 
-            self.staged.insert(
-                kv.request_id.to_string(),
-                StagedKv {
-                    storage,
-                    addr,
-                    len: total as u64,
-                    pattern,
-                },
-            );
+            self.staged.insert(kv.request_id.to_string(), storage);
             debug!(
                 request_id = kv.request_id,
                 blocks = n_blocks,
@@ -256,28 +261,64 @@ mod nixl {
                 host: self.cfg.side_channel_host.clone(),
                 port: self.cfg.side_channel_port,
                 block_ids: (0..n_blocks as i64).collect(),
+                addr,
+                len: total as u64,
+                pattern,
             })
         }
 
-        /// Real NIXL READ from a staged source buffer into a fresh landing buffer, using
-        /// `remote_name` as the NIXL remote agent. Verifies the pattern. This is the
-        /// transfer mechanic; the in-process path addresses our own agent, the cross-pod
-        /// path (TODO: ZMQ side channel) will address the peer's.
-        fn read_staged(&self, src: &StagedKv, remote_name: &str) -> Result<u64> {
+        /// Pull a remote prefill's KV: fetch its NIXL metadata from its listener at
+        /// host:port, then post a NIXL READ from the advertised buffer into a fresh local
+        /// landing buffer, and verify the pattern. Decode and prefill are distinct agents.
+        fn do_pull(&mut self, kv: RequestKv<'_>, remote: &RemoteKv) -> Result<u64> {
+            if remote.len == 0 {
+                // Peer advertised no real buffer (e.g. a no-op prefill plane); nothing to move.
+                return Ok(0);
+            }
+
+            // The remote source descriptor (the prefill's registered KV buffer).
+            let mut remote_descs = XferDescList::new(MemType::Dram).map_err(ne)?;
+            remote_descs.add_desc(remote.addr as usize, remote.len as usize, 0);
+
+            // Fetch the prefill agent's metadata over its listener socket (ip+port in the
+            // opt args). The fetch is async, so poll check_remote_metadata (for these descs)
+            // until the metadata has actually loaded before creating the transfer.
+            let mut fetch_opt = self.opt_args()?;
+            fetch_opt.set_ip_addr(&remote.host).map_err(ne)?;
+            fetch_opt.set_port(remote.port as u16).map_err(ne)?;
+            self.agent
+                .fetch_remote_md(&remote.engine_id, Some(&fetch_opt))
+                .map_err(ne)?;
+            let start = Instant::now();
+            while !self
+                .agent
+                .check_remote_metadata(&remote.engine_id, Some(&remote_descs))
+            {
+                if start.elapsed() > XFER_TIMEOUT {
+                    bail!("timed out fetching NIXL metadata for {}", remote.engine_id);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            // Land the bytes in a fresh, registered local buffer.
             let opt = self.opt_args()?;
-            let mut dst = SystemStorage::new(src.len as usize).map_err(ne)?;
+            let mut dst = SystemStorage::new(remote.len as usize).map_err(ne)?;
             dst.register(&self.agent, Some(&opt)).map_err(ne)?;
-            // SAFETY: same stable-heap-address reasoning as the prefill side.
+            // SAFETY: stable heap address of the Vec backing the storage.
             let dst_base = unsafe { dst.as_ptr() as usize };
 
             let mut local = XferDescList::new(MemType::Dram).map_err(ne)?;
-            let mut remote = XferDescList::new(MemType::Dram).map_err(ne)?;
-            local.add_desc(dst_base, src.len as usize, 0);
-            remote.add_desc(src.addr as usize, src.len as usize, 0);
+            local.add_desc(dst_base, remote.len as usize, 0);
 
             let req = self
                 .agent
-                .create_xfer_req(XferOp::Read, &local, &remote, remote_name, Some(&opt))
+                .create_xfer_req(
+                    XferOp::Read,
+                    &local,
+                    &remote_descs,
+                    &remote.engine_id,
+                    Some(&opt),
+                )
                 .map_err(ne)?;
             self.agent.post_xfer_req(&req, Some(&opt)).map_err(ne)?;
 
@@ -287,50 +328,28 @@ mod nixl {
                     break;
                 }
                 if start.elapsed() > XFER_TIMEOUT {
-                    bail!("NIXL READ from {remote_name} timed out after {XFER_TIMEOUT:?}");
+                    bail!(
+                        "NIXL READ from {} timed out after {XFER_TIMEOUT:?}",
+                        remote.engine_id
+                    );
                 }
                 std::thread::sleep(Duration::from_micros(200));
             }
 
             let got = dst.as_slice().first().copied();
-            if got != Some(src.pattern) {
+            if got != Some(remote.pattern) {
                 bail!(
                     "KV verify failed: expected 0x{:02x}, got {got:?}",
-                    src.pattern
+                    remote.pattern
                 );
             }
-            Ok(src.len)
-        }
-
-        fn do_pull(&mut self, kv: RequestKv<'_>, remote: &RemoteKv) -> Result<u64> {
-            // In-process path: the prefill and decode roles are the same agent (e.g. the
-            // loopback test), so the source buffer is staged locally and the remote agent
-            // is ourselves. Address self by loading our own metadata as a remote.
-            if remote.engine_id == self.cfg.engine_id
-                && let Some(src) = self.staged.remove(kv.request_id)
-            {
-                let md = self.agent.get_local_md().map_err(ne)?;
-                let self_name = self.agent.load_remote_md(&md).map_err(ne)?;
-                let bytes = self.read_staged(&src, &self_name)?;
-                debug!(
-                    request_id = kv.request_id,
-                    bytes, "pulled + verified KV (in-process)"
-                );
-                return Ok(bytes);
-            }
-
-            // TODO(increment-2): cross-pod pull. Connect a ZMQ REQ socket to
-            // `remote.host:remote.port`, send `msgpack((b"get_meta_msg", rank))`, decode the
-            // NixlHandshakePayload -> NixlAgentMetadata, `load_remote_md(agent_metadata)`,
-            // build remote descs from base_addr + block_id*block_len, then `read_staged`.
-            warn!(
+            debug!(
                 request_id = kv.request_id,
+                bytes = remote.len,
                 engine_id = remote.engine_id,
-                host = remote.host,
-                port = remote.port,
-                "cross-pod NIXL pull not wired yet (needs the ZMQ side channel); skipping transfer"
+                "pulled + verified KV over NIXL"
             );
-            Ok(0)
+            Ok(remote.len)
         }
     }
 
@@ -344,6 +363,9 @@ mod nixl {
                     host: self.cfg.side_channel_host.clone(),
                     port: self.cfg.side_channel_port,
                     block_ids: vec![0],
+                    addr: 0,
+                    len: 0,
+                    pattern: 0,
                 });
             }
             self.do_advertise(kv)

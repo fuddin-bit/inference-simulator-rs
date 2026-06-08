@@ -54,9 +54,16 @@ RUN git clone https://github.com/ai-dynamo/nixl.git /src/nixl \
     && echo /usr/local/lib64  >> /etc/ld.so.conf.d/nixl.conf \
     && echo /usr/local/lib    >> /etc/ld.so.conf.d/nixl.conf \
     && ldconfig
-ENV PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/ucx/lib/pkgconfig"
+# Keep the system pkgconfig dirs so openssl (vllm-rs) is still found alongside ucx/nixl.
+ENV PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/ucx/lib/pkgconfig:/usr/lib64/pkgconfig:/usr/share/pkgconfig"
 
-# 2. Build the vLLM Rust frontend (vllm-rs) at the same rev as our engine-core-client dep.
+# vllm-rs needs openssl-sys (system variant) headers and the protobuf well-known types
+# (its build.rs compiles a proto importing google/protobuf/struct.proto).
+RUN dnf install -y --setopt=install_weak_deps=False openssl-devel protobuf-devel && dnf clean all
+ENV PROTOC=/usr/bin/protoc
+ENV PROTOC_INCLUDE=/usr/include
+
+# 3. Build the vLLM Rust frontend (vllm-rs) at the same rev as our engine-core-client dep.
 RUN git clone https://github.com/vllm-project/vllm.git /src/vllm \
     && cd /src/vllm && git checkout ${VLLM_REF} \
     && cd rust && cargo build --release --bin vllm-rs \

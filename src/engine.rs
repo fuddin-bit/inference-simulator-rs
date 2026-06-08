@@ -155,6 +155,19 @@ fn parse_remote_kv(kv: &JsonValue) -> Option<RemoteKv> {
             .iter()
             .filter_map(JsonValue::as_i64)
             .collect(),
+        // Mock extension fields (see RemoteKv); absent when the peer is a real vLLM.
+        addr: kv
+            .get("remote_buf_addr")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0),
+        len: kv
+            .get("remote_buf_len")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0),
+        pattern: kv
+            .get("remote_pattern")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0) as u8,
     })
 }
 
@@ -176,6 +189,10 @@ fn build_prefill_kv_params(
         "remote_port": remote.port,
         "tp_size": 1,
         "remote_num_tokens": remote_num_tokens,
+        // Mock extension: the prefill KV buffer the decode peer reads over NIXL.
+        "remote_buf_addr": remote.addr,
+        "remote_buf_len": remote.len,
+        "remote_pattern": remote.pattern,
     })
 }
 
