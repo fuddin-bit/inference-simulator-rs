@@ -118,15 +118,39 @@ fn utility_response(
     })
 }
 
-/// Best-effort extraction of `kv_transfer_params` a decode engine would pull against.
-///
-/// TODO(bird-two): the engine-core `EngineCoreRequest` does not surface
-/// `kv_transfer_params` as a typed field today; in real vLLM the decode side gets
-/// them via the connector. Once we settle on the sim-to-sim handshake this returns
-/// the remote descriptors. For now it is always `None`, so `pull_prefilled` is wired
-/// but dormant.
-fn extract_kv_params(_request: &EngineCoreRequest) -> Option<JsonValue> {
-    None
+/// The `kv_transfer_params` the frontend ferries down from the OpenAI request. The
+/// server merges them into `sampling_params.extra_args["kv_transfer_params"]`
+/// (mirroring Python vLLM), so that is where the P/D intent (`do_remote_prefill` /
+/// `do_remote_decode` / `remote_*`) arrives. In real vLLM the produce/consume logic
+/// lives in the NixlConnector inside the engine; here our data plane plays that role.
+fn extract_kv_params(request: &EngineCoreRequest) -> Option<JsonValue> {
+    request
+        .sampling_params
+        .as_ref()?
+        .extra_args
+        .as_ref()?
+        .get("kv_transfer_params")
+        .cloned()
+}
+
+/// Phase 0 probe: a prefill-style request (`do_remote_decode: true`) gets a stub
+/// remote descriptor echoed back so we can confirm `kv_transfer_params` survives the
+/// full round trip through the real frontend. The real values land in the wire-compat
+/// rework (mirroring `nixl_connector.py`); this only proves the channel.
+fn phase0_probe_response(kv: &JsonValue) -> Option<JsonValue> {
+    let is_prefill = kv
+        .get("do_remote_decode")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    is_prefill.then(|| {
+        serde_json::json!({
+            "remote_block_ids": [0],
+            "remote_engine_id": "mock-engine-nixl",
+            "remote_host": "127.0.0.1",
+            "remote_port": 0,
+            "phase0_probe": true,
+        })
+    })
 }
 
 /// Message sent from the IO loop to the engine task to drive the engine loop.
@@ -152,6 +176,9 @@ struct ActiveRequest {
     max_tokens: usize,
     generated: usize,
     rng: StdRng,
+    /// `kv_transfer_params` to stamp on this request's finishing output (Phase 0 probe
+    /// today; the prefill engine's real remote descriptor after the wire-compat rework).
+    advertise_on_finish: Option<JsonValue>,
 }
 
 impl ActiveRequest {
@@ -161,6 +188,8 @@ impl ActiveRequest {
         request: Box<EngineCoreRequest>,
         opt: &Opt,
     ) -> Result<Self, EngineCoreFinishReason> {
+        let incoming_kv = extract_kv_params(&request);
+        let advertise_on_finish = incoming_kv.as_ref().and_then(phase0_probe_response);
         let request_id = request.request_id;
         let client_index = request.client_index;
         let prompt_len = request
@@ -177,6 +206,10 @@ impl ActiveRequest {
             return Err(EngineCoreFinishReason::Error);
         };
         let max_tokens = sampling_params.max_tokens as usize;
+
+        if let Some(kv) = &incoming_kv {
+            info!(request_id, %kv, "received kv_transfer_params from frontend");
+        }
 
         if opt.log_requests {
             info!(
@@ -199,6 +232,7 @@ impl ActiveRequest {
             prompt_len,
             max_tokens,
             generated: 0,
+            advertise_on_finish,
         })
     }
 
@@ -213,11 +247,15 @@ impl ActiveRequest {
         self.generated += chunk_len;
 
         let finished = self.generated >= self.max_tokens;
-        request_output(
+        let mut output = request_output(
             self.request_id.clone(),
             new_token_ids,
             finished.then_some(EngineCoreFinishReason::Length),
-        )
+        );
+        if finished {
+            output.kv_transfer_params = self.advertise_on_finish.take();
+        }
+        output
     }
 }
 
