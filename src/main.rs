@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
-use mock_engine_nixl::Opt;
+use inference_simulator_rs::Opt;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, info};
 
@@ -37,6 +37,6 @@ fn main() -> Result<()> {
 
     runtime.block_on(async move {
         let shutdown = shutdown_signal();
-        mock_engine_nixl::run(opt, shutdown).await
+        inference_simulator_rs::run(opt, shutdown).await
     })
 }

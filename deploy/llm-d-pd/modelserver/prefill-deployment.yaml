@@ -1,6 +1,6 @@
 # Prefill instances. Adapted from the llm-d pd-disaggregation GPU/vLLM model server:
 # our CPU mock image instead of vllm/vllm-openai, no GPU, a small model for a light
-# tokenizer. The image's entrypoint runs vllm-rs (frontend) + mock-engine-nixl (engine).
+# tokenizer. The image's entrypoint runs vllm-rs (frontend) + inference-sim (engine).
 apiVersion: apps/v1
 kind: Deployment
 metadata:

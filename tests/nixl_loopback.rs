@@ -8,7 +8,9 @@
 
 #![cfg(feature = "nixl")]
 
-use mock_engine_nixl::dataplane::{NixlConfig, PdRole, RequestKv, make_data_plane, nixl_is_stub};
+use inference_simulator_rs::dataplane::{
+    NixlConfig, PdRole, RequestKv, make_data_plane, nixl_is_stub,
+};
 
 fn cfg(engine_id: &str, port: u32) -> NixlConfig {
     NixlConfig {

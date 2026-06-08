@@ -70,10 +70,10 @@ RUN git clone https://github.com/vllm-project/vllm.git /src/vllm \
     && cp target/release/vllm-rs /usr/local/bin/vllm-rs
 
 # 3. Build our mock engine against the real libnixl.
-COPY . /src/mock-engine-nixl
-RUN cd /src/mock-engine-nixl \
+COPY . /src/inference-simulator-rs
+RUN cd /src/inference-simulator-rs \
     && cargo build --release --features nixl \
-    && cp target/release/mock-engine-nixl /usr/local/bin/mock-engine-nixl
+    && cp target/release/inference-sim /usr/local/bin/inference-sim
 
 # ---------------------------------------------------------------------------------------
 FROM fedora:${FEDORA_VERSION} AS runtime
@@ -88,7 +88,7 @@ COPY --from=builder /usr/local/ucx/ /usr/local/ucx/
 COPY --from=builder /usr/local/lib64/ /usr/local/lib64/
 COPY --from=builder /usr/local/lib/ /usr/local/lib/
 COPY --from=builder /usr/local/bin/vllm-rs /usr/local/bin/vllm-rs
-COPY --from=builder /usr/local/bin/mock-engine-nixl /usr/local/bin/mock-engine-nixl
+COPY --from=builder /usr/local/bin/inference-sim /usr/local/bin/inference-sim
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN echo /usr/local/ucx/lib > /etc/ld.so.conf.d/nixl.conf \
     && echo /usr/local/lib64 >> /etc/ld.so.conf.d/nixl.conf \

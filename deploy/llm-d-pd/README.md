@@ -1,7 +1,7 @@
 # GPU-free llm-d P/D, end to end
 
 A self-contained, vendored copy of the llm-d v0.7.0 prefill/decode "well-lit path",
-repointed at the `mock-engine-nixl` image. It stands up the **real** llm-d control plane
+repointed at the `inference-simulator-rs` image. It stands up the **real** llm-d control plane
 (Router/EPP, InferencePool, routing sidecar) in front of GPU-free model servers that run
 the **real** vLLM Rust frontend over our mock engine, and move KV across instances over
 **real NIXL/UCX on CPU**. No GPUs, no model weights, just a tokenizer.

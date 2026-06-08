@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Launch the two processes that make up a mock model-server pod: the real vLLM Rust
-# frontend (vllm-rs) and our mock engine-core backend (mock-engine-nixl), wired over
+# frontend (vllm-rs) and our mock engine-core backend (inference-simulator-rs), wired over
 # the in-pod engine-core handshake. Role, identity, and ports come from the env so the
 # same image serves as a prefill or a decode instance in the llm-d P/D path.
 set -euo pipefail
@@ -30,7 +30,7 @@ vllm-rs serve "$MODEL" \
 FRONTEND_PID=$!
 
 # Engine: connects as the headless DP engine, plays the NixlConnector role.
-mock-engine-nixl \
+inference-sim \
     --handshake-address "tcp://127.0.0.1:${HANDSHAKE_PORT}" \
     --pd-role "$ROLE" \
     --engine-id "$ENGINE_ID" \

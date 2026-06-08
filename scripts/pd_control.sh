@@ -19,7 +19,7 @@ ENGINE_ID="${ENGINE_ID:-mock-prefill-0}"
 FRONTEND_BIN="${FRONTEND_BIN:-$HOME/git/vllm-main/rust/target/debug/vllm-rs}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENGINE_BIN="$REPO_ROOT/target/debug/mock-engine-nixl"
+ENGINE_BIN="$REPO_ROOT/target/debug/inference-sim"
 BASE_URL="http://127.0.0.1:${HTTP_PORT}"
 LOG_DIR="$(mktemp -d)"
 

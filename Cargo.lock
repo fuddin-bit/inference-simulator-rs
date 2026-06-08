@@ -767,6 +767,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "inference-simulator-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "futures",
+ "nixl-sys",
+ "rand",
+ "rmpv",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "vllm-engine-core-client",
+ "zeromq",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -897,27 +918,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
-]
-
-[[package]]
-name = "mock-engine-nixl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "futures",
- "nixl-sys",
- "rand",
- "rmpv",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "vllm-engine-core-client",
- "zeromq",
 ]
 
 [[package]]

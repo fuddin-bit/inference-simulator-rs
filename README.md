@@ -1,4 +1,4 @@
-# mock-engine-nixl
+# inference-simulator-rs
 
 A mock vLLM **V1 engine-core** backend that speaks the real ZMQ + msgpack protocol,
 with a prefill/decode **KV data plane over NIXL** so you can exercise real-ish P/D
@@ -27,7 +27,7 @@ upstream:
 
 ```
             ZMQ + msgpack (real engine-core protocol)
- vLLM frontend  ◀──────────────────────────────────▶  mock-engine-nixl
+ vLLM frontend  ◀──────────────────────────────────▶  inference-simulator-rs
  (Rust or Py)        handshake / ADD / ABORT / UTILITY        │
                                                               ▼
                                               ┌──────────────────────────────┐
@@ -122,6 +122,8 @@ cargo run --features nixl -- --pd-role decode  ...
 
 - `vllm-engine-core-client` — pinned git dep on `vllm-project/vllm` (`rev` in
   `Cargo.toml`). Bump the rev to track upstream protocol changes.
-- `nixl-sys` — local **path** dependency on the nixl checkout
-  (`/Users/weaton/git/nixl/src/bindings/rust`). Adjust the path for your machine, or
-  repoint at the upstream repo.
+- `nixl-sys` — pinned git dep on `ai-dynamo/nixl` (`rev` in `Cargo.toml`), the same
+  source the image builds `libnixl` from, so the crate resolves identically on macOS
+  (stub) and in the container (real lib).
+
+The binary is `inference-sim`; the k8s deployment lives in `deploy/llm-d-pd/`.

@@ -29,7 +29,7 @@ use dataplane::PdRole;
 /// Mock engine-core backend for frontend + prefill/decode data-plane testing.
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "mock-engine-nixl",
+    name = "inference-sim",
     about = "Run a mock vLLM engine-core backend with an optional NIXL KV data plane."
 )]
 pub struct Opt {

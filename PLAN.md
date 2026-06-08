@@ -1,4 +1,4 @@
-# mock-engine-nixl — next-session plan
+# inference-simulator-rs — next-session plan
 
 ## Where we are (done, all committed)
 

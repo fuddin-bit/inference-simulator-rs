@@ -10,7 +10,7 @@
 # Layout:
 #   vllm-rs serve --data-parallel-size-local 0   (binds handshake, waits for engine)
 #        │  ZMQ + msgpack engine-core protocol
-#   mock-engine-nixl --handshake-address ...      (our backend, fakes the model)
+#   inference-simulator-rs --handshake-address ...      (our backend, fakes the model)
 #
 # Override any of these via env:
 set -euo pipefail
@@ -22,7 +22,7 @@ HTTP_PORT="${HTTP_PORT:-8000}"
 FRONTEND_BIN="${FRONTEND_BIN:-$HOME/git/vllm-main/rust/target/debug/vllm-rs}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENGINE_BIN="$REPO_ROOT/target/debug/mock-engine-nixl"
+ENGINE_BIN="$REPO_ROOT/target/debug/inference-sim"
 BASE_URL="http://${HTTP_HOST}:${HTTP_PORT}"
 LOG_DIR="$(mktemp -d)"
 
