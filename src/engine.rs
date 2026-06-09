@@ -19,11 +19,12 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::stats::{
     BaseCacheStats, PrefillStats, PrefixCacheStats, SchedulerStats,
 };
 use vllm_engine_core_client::protocol::utility::{
-    EngineCoreUtilityRequest, UtilityOutput, UtilityResultEnvelope,
+    EngineCoreUtilityRequest, UtilityCallId, UtilityOutput, UtilityResultEnvelope,
 };
 use vllm_engine_core_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
@@ -33,6 +34,7 @@ use crate::blockpool::BlockPool;
 use crate::dataplane::{KvDataPlane, NixlConfig, RemoteKv, RequestKv, make_data_plane};
 use crate::kvevents::{self, KvEventTx};
 use crate::latency::LatencyModel;
+use crate::lora::LoraRegistry;
 use crate::{Opt, SchedulingPolicy};
 
 /// Per-step token demand of a single prefilling request: a (possibly chunked) slice of its
@@ -111,7 +113,26 @@ where
     ))
 }
 
-/// Produce the minimal utility responses needed by a real frontend.
+/// Wrap a utility result envelope in the `EngineCoreOutputs` the frontend awaits for `call_id`.
+fn utility_result_outputs(
+    engine_index: u32,
+    call_id: UtilityCallId,
+    result: UtilityResultEnvelope,
+) -> EngineCoreOutputs {
+    EngineCoreOutputs {
+        engine_index,
+        utility_output: Some(UtilityOutput {
+            call_id,
+            failure_message: None,
+            result: Some(result),
+        }),
+        timestamp: now_secs(),
+        ..Default::default()
+    }
+}
+
+/// Produce the minimal utility responses needed by a real frontend. LoRA load/unload
+/// (`add_lora`/`remove_lora`) is handled on `Engine` instead, since it mutates adapter state.
 fn utility_response(
     engine_index: u32,
     request: EngineCoreUtilityRequest,
@@ -129,16 +150,11 @@ fn utility_response(
         _ => utility_envelope(MsgpackValue::Nil),
     }?;
 
-    Ok(EngineCoreOutputs {
+    Ok(utility_result_outputs(
         engine_index,
-        utility_output: Some(UtilityOutput {
-            call_id: request.call_id,
-            failure_message: None,
-            result: Some(result),
-        }),
-        timestamp: now_secs(),
-        ..Default::default()
-    })
+        request.call_id,
+        result,
+    ))
 }
 
 /// The `kv_transfer_params` the frontend ferries down from the OpenAI request. The
@@ -245,6 +261,9 @@ struct ActiveRequest {
     /// Physical block-pool slot ids this request pins (prompt blocks). Unpinned on finish or
     /// abort so they become evictable; also the `remote_block_ids` the data plane pages.
     block_ids: Vec<usize>,
+    /// The LoRA adapter this request runs against, if any (from `EngineCoreRequest.lora_request`).
+    /// Drives the per-adapter running count and the LoRA slot cap. `None` is the base model.
+    lora_name: Option<String>,
     /// When the next output token is due. Set to `now + first-token delay` at admission, then
     /// advanced by the inter-token delay after each emitted token. The engine loop sleeps
     /// until the earliest deadline across all active requests, so this is the timing model.
@@ -274,6 +293,7 @@ impl ActiveRequest {
             .as_ref()
             .map(|kv| kv_flag(kv, "do_remote_prefill"))
             .unwrap_or(false);
+        let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.clone());
         let request_id = request.request_id;
         let client_index = request.client_index;
         let prompt_len = request
@@ -331,6 +351,7 @@ impl ActiveRequest {
             remote_prefill,
             num_local_cached_tokens,
             block_ids,
+            lora_name,
             next_at: Instant::now() + first_delay,
         })
     }
@@ -400,6 +421,9 @@ struct Engine {
     events: Option<KvEventTx>,
     /// RNG for failure injection (Phase 5), seeded per engine for reproducibility.
     failure_rng: StdRng,
+    /// Loaded LoRA adapters + the running-batch slot cap. Adapters arrive via `add_lora`
+    /// utility calls; per-request usage drives the `running/waiting_lora_adapters` stats.
+    loras: LoraRegistry,
     /// The running batch: requests being actively decoded. Capped at `max_num_seqs`.
     active_requests: HashMap<String, ActiveRequest>,
     /// Admitted-but-not-yet-running requests, in arrival order. Drained into `active_requests`
@@ -435,6 +459,77 @@ impl Engine {
             return Some(self.opt.failure_types[idx].finish_reason());
         }
         None
+    }
+
+    /// Handle a LoRA load/unload utility call, mutating the adapter registry. Returns the
+    /// `bool`-carrying response the frontend awaits, or `None` if this isn't a LoRA method (so
+    /// the caller falls back to the generic `utility_response`). The frontend encodes both
+    /// methods' args as a one-element tuple: `(LoraRequest,)` for `add_lora`, `(lora_int_id,)`
+    /// for `remove_lora`.
+    fn lora_utility_outputs(
+        &mut self,
+        request: &EngineCoreUtilityRequest,
+    ) -> Result<Option<EngineCoreOutputs>> {
+        let ok = match request.method_name.as_str() {
+            "add_lora" => {
+                let (lora,): (LoraRequest,) = rmpv::ext::from_value(request.args.clone())
+                    .map_err(|error| anyhow!("decoding add_lora args: {error}"))?;
+                let name = lora.lora_name.clone();
+                let id = lora.lora_int_id;
+                let ok = self.loras.add(lora);
+                info!(engine_index = self.engine_index, lora = %name, id, "add_lora");
+                ok
+            }
+            "remove_lora" => {
+                let (lora_int_id,): (u64,) = rmpv::ext::from_value(request.args.clone())
+                    .map_err(|error| anyhow!("decoding remove_lora args: {error}"))?;
+                let ok = self.loras.remove(lora_int_id);
+                info!(
+                    engine_index = self.engine_index,
+                    id = lora_int_id,
+                    ok,
+                    "remove_lora"
+                );
+                ok
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(utility_result_outputs(
+            self.engine_index,
+            request.call_id,
+            UtilityResultEnvelope::without_type_info(rmpv::ext::to_value(ok)?),
+        )))
+    }
+
+    /// Count running requests per LoRA adapter (from the batch) and waiting requests per
+    /// adapter (from the queue) for the `running_lora_adapters`/`waiting_lora_adapters`
+    /// scheduler stats. Base-model requests carry no adapter and are not counted.
+    fn lora_counts(&self) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+        let mut running = BTreeMap::new();
+        for request in self.active_requests.values() {
+            if let Some(name) = &request.lora_name {
+                *running.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut waiting = BTreeMap::new();
+        for request in &self.waiting {
+            if let Some(lora) = &request.lora_request {
+                *waiting.entry(lora.lora_name.clone()).or_insert(0) += 1;
+            }
+        }
+        (running, waiting)
+    }
+
+    /// Whether the LoRA slot cap lets this request join the running batch right now (see
+    /// `LoraRegistry::admits`). The running batch's distinct adapters are read live.
+    fn lora_admits(&self, request: &EngineCoreRequest) -> bool {
+        let lora_name = request.lora_request.as_ref().map(|l| l.lora_name.as_str());
+        self.loras.admits(
+            lora_name,
+            self.active_requests
+                .values()
+                .filter_map(|r| r.lora_name.as_deref()),
+        )
     }
 
     /// Drain one frontend request message.
@@ -557,9 +652,15 @@ impl Engine {
                     events.publish(vec![event]);
                 }
                 let client_index = request.client_index;
+                // LoRA load/unload mutates adapter state, so it's handled here; everything else
+                // falls back to the stateless generic responder.
+                let outputs_msg = match self.lora_utility_outputs(&request)? {
+                    Some(outputs_msg) => outputs_msg,
+                    None => utility_response(self.engine_index, request)?,
+                };
                 outputs.push(EngineOutput {
                     client_index,
-                    outputs: utility_response(self.engine_index, request)?,
+                    outputs: outputs_msg,
                 });
             }
 
@@ -657,27 +758,35 @@ impl Engine {
             .sum()
     }
 
-    /// Pop the next request to admit, honoring the scheduling policy: FIFO for `fcfs`, or the
-    /// smallest `(priority, arrival_time)` for `priority` (matching vLLM's priority queue).
-    fn pop_next_waiting(&mut self) -> Option<Box<EngineCoreRequest>> {
+    /// Index of the next waiting request to admit, honoring the scheduling policy (FIFO for
+    /// `fcfs`, smallest `(priority, arrival_time)` for `priority`) but considering only
+    /// requests that currently pass the LoRA slot cap. LoRA-blocked requests are skipped over
+    /// (they stay queued and surface as `num_skipped_waiting_reqs`), matching vLLM rather than
+    /// head-of-line blocking the whole queue on one stuck adapter. `None` if nothing is
+    /// admissible right now.
+    fn next_admissible_index(&self) -> Option<usize> {
         match self.opt.scheduling_policy {
-            SchedulingPolicy::Fcfs => self.waiting.pop_front(),
-            SchedulingPolicy::Priority => {
-                let idx = self
-                    .waiting
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| {
-                        a.priority.cmp(&b.priority).then_with(|| {
-                            a.arrival_time
-                                .partial_cmp(&b.arrival_time)
-                                .unwrap_or(Ordering::Equal)
-                        })
+            SchedulingPolicy::Fcfs => self.waiting.iter().position(|r| self.lora_admits(r)),
+            SchedulingPolicy::Priority => self
+                .waiting
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| self.lora_admits(r))
+                .min_by(|(_, a), (_, b)| {
+                    a.priority.cmp(&b.priority).then_with(|| {
+                        a.arrival_time
+                            .partial_cmp(&b.arrival_time)
+                            .unwrap_or(Ordering::Equal)
                     })
-                    .map(|(i, _)| i)?;
-                self.waiting.remove(idx)
-            }
+                })
+                .map(|(i, _)| i),
         }
+    }
+
+    /// Number of waiting requests the LoRA slot cap is currently blocking (vLLM's skipped
+    /// waiting queue). Computed against the running batch's resident adapters.
+    fn num_lora_skipped(&self) -> u64 {
+        self.waiting.iter().filter(|r| !self.lora_admits(r)).count() as u64
     }
 
     /// Admit waiting requests into the running batch (in policy order) until the seq cap
@@ -691,9 +800,14 @@ impl Engine {
         let mut demand = self.scheduled_token_demand();
 
         while self.active_requests.len() < self.running_capacity() && demand < budget {
-            let Some(request) = self.pop_next_waiting() else {
+            // Next admissible request in policy order, skipping any the LoRA slot cap blocks.
+            let Some(idx) = self.next_admissible_index() else {
                 break;
             };
+            let request = self
+                .waiting
+                .remove(idx)
+                .expect("index from next_admissible_index is valid");
             // The token demand this request adds once admitted (it starts by prefilling).
             let prompt_len = request
                 .prompt_token_ids
@@ -850,9 +964,11 @@ impl Engine {
     /// does `inc_by` on them), so each snapshot drains them.
     fn scheduler_stats(&mut self) -> SchedulerStats {
         let prefix = self.pool.take_stats();
+        let (running_lora_adapters, waiting_lora_adapters) = self.lora_counts();
         SchedulerStats {
             num_running_reqs: self.active_requests.len() as u64,
             num_waiting_reqs: self.waiting.len() as u64,
+            num_skipped_waiting_reqs: self.num_lora_skipped(),
             kv_cache_usage: self.pool.usage(),
             prefix_cache_stats: PrefixCacheStats {
                 base: BaseCacheStats {
@@ -863,6 +979,8 @@ impl Engine {
                 },
                 ..Default::default()
             },
+            running_lora_adapters,
+            waiting_lora_adapters,
             ..Default::default()
         }
     }
@@ -897,6 +1015,7 @@ pub(crate) async fn run_engine_loop(
     };
     let latency = opt.latency_model();
     let opt_seed = opt.seed;
+    let max_loras = opt.max_loras as usize;
     let pool = BlockPool::new(
         opt.tokens_per_block,
         opt.kv_cache_size as usize,
@@ -918,6 +1037,7 @@ pub(crate) async fn run_engine_loop(
         failure_rng: StdRng::seed_from_u64(
             opt_seed ^ (engine_index as u64).wrapping_mul(0x9e3779b9),
         ),
+        loras: LoraRegistry::new(max_loras),
         active_requests: HashMap::new(),
         waiting: VecDeque::new(),
     };
@@ -989,6 +1109,7 @@ mod tests {
             pool,
             events: None,
             failure_rng: StdRng::seed_from_u64(opt.seed),
+            loras: LoraRegistry::new(opt.max_loras as usize),
             active_requests: HashMap::new(),
             waiting: VecDeque::new(),
             opt,
@@ -1380,6 +1501,136 @@ mod tests {
         engine.step();
         assert!(engine.active_requests.len() > 2);
         assert!(engine.waiting.len() < 3);
+    }
+
+    /// Build a request bound to a LoRA adapter (as the frontend would after the model name
+    /// resolved to a loaded adapter).
+    fn lora_request(id: &str, lora_name: &str, lora_int_id: u64) -> EngineCoreRequest {
+        EngineCoreRequest {
+            lora_request: Some(LoraRequest::new(
+                lora_name.to_string(),
+                lora_int_id,
+                format!("/loras/{lora_name}"),
+                false,
+                false,
+            )),
+            ..request(id, 4, 50)
+        }
+    }
+
+    /// Send a utility call and decode its typed result, the way the frontend's client does.
+    fn call_utility<T: serde::de::DeserializeOwned, A: serde::Serialize + std::fmt::Debug>(
+        engine: &mut Engine,
+        method: &str,
+        args: A,
+    ) -> T {
+        let request = EngineCoreUtilityRequest::new(0, 1, method, args).expect("build utility");
+        let mut out = engine
+            .handle_input(EngineInput::Utility(request))
+            .expect("handle_input");
+        out.remove(0)
+            .outputs
+            .utility_output
+            .expect("utility output")
+            .into_typed_result::<T>(method)
+            .expect("typed result")
+    }
+
+    #[test]
+    fn add_and_remove_lora_utilities_report_bool() {
+        let mut engine = test_engine(test_opt());
+        let lora = LoraRequest::new(
+            "adapterA".to_string(),
+            7,
+            "/loras/a".to_string(),
+            false,
+            false,
+        );
+        assert!(call_utility::<bool, _>(&mut engine, "add_lora", (lora,)));
+        // First remove finds it; second reports it gone.
+        assert!(call_utility::<bool, _>(&mut engine, "remove_lora", (7u64,)));
+        assert!(!call_utility::<bool, _>(
+            &mut engine,
+            "remove_lora",
+            (7u64,)
+        ));
+    }
+
+    #[test]
+    fn running_request_counts_into_lora_adapters() {
+        let mut engine = test_engine(test_opt());
+        add(&mut engine, lora_request("r1", "adapterA", 1));
+        let stats = engine.scheduler_stats();
+        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
+        assert!(stats.waiting_lora_adapters.is_empty());
+        // A base-model request adds nothing to the adapter maps.
+        add(&mut engine, request("base", 4, 50));
+        let stats = engine.scheduler_stats();
+        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
+        assert_eq!(stats.running_lora_adapters.len(), 1);
+    }
+
+    #[test]
+    fn waiting_requests_count_into_waiting_lora_adapters() {
+        let mut opt = test_opt();
+        opt.max_num_seqs = 1; // one slot, so the rest queue behind it
+        let mut engine = test_engine(opt);
+
+        add(&mut engine, lora_request("run", "adapterA", 1));
+        add(&mut engine, lora_request("wait1", "adapterB", 2));
+        add(&mut engine, lora_request("wait2", "adapterB", 2));
+        let stats = engine.scheduler_stats();
+        assert_eq!(stats.running_lora_adapters.get("adapterA"), Some(&1));
+        assert_eq!(
+            stats.waiting_lora_adapters.get("adapterB"),
+            Some(&2),
+            "both queued requests for adapterB counted"
+        );
+    }
+
+    #[test]
+    fn max_loras_blocks_a_new_adapter_until_a_slot_frees() {
+        let mut opt = test_opt();
+        opt.max_loras = 1; // only one distinct adapter may run at a time
+        opt.max_num_seqs = 8; // seq slots are not the binding limit here
+        let mut engine = test_engine(opt);
+
+        // adapterA takes the single LoRA slot; adapterB can't be admitted and waits, even
+        // though seq slots are free.
+        add(&mut engine, lora_request("a", "adapterA", 1));
+        add(&mut engine, lora_request("b", "adapterB", 2));
+        assert_eq!(engine.active_requests.len(), 1);
+        assert!(engine.active_requests.contains_key("a"));
+        assert_eq!(engine.waiting.len(), 1);
+
+        // The blocked adapterB request surfaces as skipped, not just waiting.
+        assert_eq!(engine.scheduler_stats().num_skipped_waiting_reqs, 1);
+
+        // A second adapterA request shares the resident slot, so it's admitted even though it
+        // arrived behind the blocked adapterB request (skip-and-continue, not head-of-line).
+        add(&mut engine, lora_request("a2", "adapterA", 1));
+        assert!(
+            engine.active_requests.contains_key("a2"),
+            "same adapter needs no new slot, skips past the blocked one"
+        );
+        assert!(
+            engine.waiting.iter().any(|r| r.request_id == "b"),
+            "adapterB still waits"
+        );
+    }
+
+    #[test]
+    fn max_loras_zero_never_blocks_on_adapter_diversity() {
+        let mut opt = test_opt();
+        opt.max_loras = 0; // cap disabled
+        opt.max_num_seqs = 8;
+        let mut engine = test_engine(opt);
+
+        add(&mut engine, lora_request("a", "adapterA", 1));
+        add(&mut engine, lora_request("b", "adapterB", 2));
+        add(&mut engine, lora_request("c", "adapterC", 3));
+        assert_eq!(engine.active_requests.len(), 3, "all distinct adapters run");
+        assert!(engine.waiting.is_empty());
     }
 
     #[test]
