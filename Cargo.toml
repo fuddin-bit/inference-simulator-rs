@@ -9,6 +9,14 @@ description = "A mock vLLM V1 engine-core backend that speaks the real ZMQ/msgpa
 name = "inference-sim"
 path = "src/main.rs"
 
+[[bin]]
+name = "inference-sim-trace"
+path = "src/bin/inference_sim_trace.rs"
+
+[[bin]]
+name = "inference-sim-tap"
+path = "src/bin/inference_sim_tap.rs"
+
 [features]
 default = []
 # Real NIXL KV data plane. Needs libnixl + UCX installed (Linux, RDMA or shared-memory).

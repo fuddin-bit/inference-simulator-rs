@@ -30,7 +30,10 @@ pub mod kvevents;
 pub mod latency;
 pub mod lora;
 mod sched;
+pub mod tap;
 mod tokens;
+pub mod trace;
+pub mod trace_convert;
 
 use dataplane::PdRole;
 use latency::KnobLatency;
@@ -127,6 +130,15 @@ pub struct Opt {
     // === Latency model (all milliseconds; 0 = instant, the default) ===
     // Ported from llm-d-inference-sim. The real frontend measures TTFT/ITL from when we
     // emit tokens, so these knobs drive both response timing and the vllm:* latency metrics.
+    /// Path to a JSONL trace file for replay-based latency. Mutually exclusive with the
+    /// timing knobs below (time_to_first_token, inter_token_latency, prefill_*). When set,
+    /// first-token and inter-token delays are sampled from recorded observations rather
+    /// than synthesized from knob parameters. KV-transfer timing for do_remote_prefill
+    /// requests still uses the kv_cache_transfer_* knobs (the trace does not cover P/D
+    /// transfer latencies).
+    #[arg(long, default_value = "")]
+    pub latency_trace: String,
+
     /// Fixed time-to-first-token. When this and its std-dev are 0, the token-count prefill
     /// model (`--prefill-overhead` + `--prefill-time-per-token`) is used instead.
     #[arg(long, default_value_t = 0)]
@@ -293,7 +305,7 @@ impl Opt {
         }
     }
 
-    /// Build the latency model from the configured timing knobs.
+    /// Build the knob-based latency model from the configured timing knobs.
     pub fn latency_model(&self) -> KnobLatency {
         KnobLatency {
             time_to_first_token: self.time_to_first_token,
@@ -310,6 +322,51 @@ impl Opt {
             time_factor_under_load: self.time_factor_under_load,
             max_num_seqs: self.max_num_seqs,
         }
+    }
+
+    /// Whether any of the timing knobs that are mutually exclusive with `--latency-trace`
+    /// have been set to a nonzero value.
+    fn has_timing_knobs(&self) -> bool {
+        self.time_to_first_token != 0
+            || self.time_to_first_token_std_dev != 0
+            || self.inter_token_latency != 0
+            || self.inter_token_latency_std_dev != 0
+            || self.prefill_overhead != 0
+            || self.prefill_time_per_token != 0
+            || self.prefill_time_std_dev != 0
+    }
+
+    /// Build the latency model: either trace-replay (from `--latency-trace`) or
+    /// knob-based. Returns an error if both are configured or if the trace file is
+    /// unreadable.
+    pub fn build_latency(&self) -> Result<Box<dyn latency::LatencyModel>> {
+        if self.latency_trace.is_empty() {
+            return Ok(Box::new(self.latency_model()));
+        }
+
+        if self.has_timing_knobs() {
+            bail!(
+                "--latency-trace is mutually exclusive with timing knobs \
+                 (time_to_first_token, inter_token_latency, prefill_*). \
+                 Remove the knobs or the trace path."
+            );
+        }
+
+        let file = std::fs::File::open(&self.latency_trace)
+            .with_context(|| format!("opening trace file: {}", self.latency_trace))?;
+        let reader = std::io::BufReader::new(file);
+        let (meta, records) = trace::read_trace(reader)
+            .with_context(|| format!("parsing trace file: {}", self.latency_trace))?;
+
+        // The KV-transfer knobs are NOT mutually exclusive: the trace does not cover
+        // P/D transfer timing, so the knob model handles do_remote_prefill requests.
+        let kv_fallback = self.latency_model();
+        let trace_model = latency::TraceLatency::from_records(meta, &records, kv_fallback)
+            .with_context(|| {
+                format!("building trace latency model from: {}", self.latency_trace)
+            })?;
+
+        Ok(Box::new(trace_model))
     }
 }
 
@@ -340,7 +397,7 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
             tracing::warn!(%error, "kv-event publisher failed to start; continuing without events");
             None
         });
-    let sim_engine = engine::SimEngine::new(engine_index, opt, events).await;
+    let sim_engine = engine::SimEngine::new(engine_index, opt, events).await?;
     let mut engine_loop = tokio::spawn(engine_core::run_loop(
         sim_engine,
         input_rx,
@@ -376,6 +433,11 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
 
 /// Run all requested mock engines until cancellation or one engine task fails.
 pub async fn run(opt: Opt, shutdown: CancellationToken) -> Result<()> {
+    // Validate the latency configuration (knob/trace conflict, trace parse) before any
+    // transport setup, so a bad config fails immediately instead of after the 30s
+    // frontend handshake timeout. Engines rebuild their own copy in SimEngine::new.
+    opt.build_latency()?;
+
     info!(?opt, "starting mock engine");
 
     let mut engines = JoinSet::new();

@@ -163,6 +163,246 @@ impl LatencyModel for FixedLatency {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TraceLatency: replay latency model driven by recorded traces
+// ---------------------------------------------------------------------------
+
+use crate::trace::{TraceMeta, TraceRecord};
+
+/// Prompt-token bucket edges (powers of two). A value `v` falls into bucket `i` where
+/// `PROMPT_EDGES[i] <= v < PROMPT_EDGES[i+1]`. The last bucket is uncapped.
+const PROMPT_EDGES: &[usize] = &[0, 65, 129, 257, 513, 1025, 2049, 4097, 8193, 16385, 32769];
+
+/// Number of prompt buckets (one per interval between edges, plus the uncapped tail).
+const NUM_PROMPT_BUCKETS: usize = PROMPT_EDGES.len();
+
+/// Map an uncached prompt token count to a bucket index.
+fn prompt_bucket(uncached_prompt_tokens: usize) -> usize {
+    // Find the last edge the value is >= to.
+    let mut bucket = 0;
+    for (i, &edge) in PROMPT_EDGES.iter().enumerate() {
+        if uncached_prompt_tokens >= edge {
+            bucket = i;
+        } else {
+            break;
+        }
+    }
+    bucket
+}
+
+/// Concurrency bucket boundaries. A concurrency value maps to the first range it fits in.
+const CONCURRENCY_RANGES: &[(u64, u64)] = &[
+    (1, 1),
+    (2, 4),
+    (5, 8),
+    (9, 16),
+    (17, 32),
+    (33, 64),
+    (65, u64::MAX),
+];
+
+const NUM_CONCURRENCY_BUCKETS: usize = 7;
+
+fn concurrency_bucket(concurrency: u64) -> usize {
+    for (i, &(lo, hi)) in CONCURRENCY_RANGES.iter().enumerate() {
+        if concurrency >= lo && concurrency <= hi {
+            return i;
+        }
+    }
+    NUM_CONCURRENCY_BUCKETS - 1
+}
+
+/// A grid cell holding sorted TTFT samples and pooled ITL samples.
+#[derive(Debug, Clone, Default)]
+struct Cell {
+    ttft_samples: Vec<f64>,
+    itl_samples: Vec<f64>,
+}
+
+/// Replay latency model: samples timing from a grid of recorded observations, bucketed
+/// by (uncached prompt tokens, concurrency). For `do_remote_prefill` requests where the
+/// trace has no transfer-time data, falls back to a wrapped `KnobLatency` for KV-transfer
+/// timing only.
+pub struct TraceLatency {
+    /// Grid indexed by [prompt_bucket][concurrency_bucket].
+    grid: Vec<Vec<Cell>>,
+    /// Pooled ITL samples per concurrency bucket (union over all prompt buckets).
+    itl_by_concurrency: Vec<Vec<f64>>,
+    /// Fallback for do_remote_prefill KV-transfer timing (the trace does not record
+    /// transfer latencies from disaggregated decode pulls).
+    kv_transfer_fallback: KnobLatency,
+    #[allow(dead_code)]
+    meta: TraceMeta,
+}
+
+impl TraceLatency {
+    /// Build from parsed trace records. Bins records into the prompt x concurrency grid.
+    /// Returns an error if the trace has no records.
+    pub fn from_records(
+        meta: TraceMeta,
+        records: &[TraceRecord],
+        kv_transfer_fallback: KnobLatency,
+    ) -> anyhow::Result<Self> {
+        if records.is_empty() {
+            anyhow::bail!("trace has no records; cannot build a replay latency model");
+        }
+
+        let mut grid = vec![vec![Cell::default(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
+
+        for record in records {
+            let uncached = record.prompt_tokens.saturating_sub(record.cached_tokens);
+            let pb = prompt_bucket(uncached);
+            let cb = concurrency_bucket(record.concurrency);
+            let cell = &mut grid[pb][cb];
+
+            cell.ttft_samples.push(record.ttft_ms);
+
+            // Expand ITL: prefer the array, fall back to the summary.
+            if let Some(itls) = &record.itl_ms {
+                cell.itl_samples.extend(itls.iter().copied());
+            } else if let Some(summary) = &record.itl_summary {
+                for _ in 0..summary.count {
+                    cell.itl_samples.push(summary.mean_ms);
+                }
+            }
+        }
+
+        // Sort TTFT samples for inverse-CDF sampling.
+        for row in &mut grid {
+            for cell in row.iter_mut() {
+                cell.ttft_samples
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                cell.itl_samples
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
+
+        // Pool ITL samples per concurrency bucket (union over prompt buckets).
+        let mut itl_by_concurrency = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
+        for row in &grid {
+            for (cb, cell) in row.iter().enumerate() {
+                itl_by_concurrency[cb].extend(cell.itl_samples.iter().copied());
+            }
+        }
+        for samples in &mut itl_by_concurrency {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        // A trace where every record is a single-token output carries no decode pacing
+        // information; refuse it up front rather than replaying instant inter-token times.
+        if itl_by_concurrency.iter().all(|samples| samples.is_empty()) {
+            anyhow::bail!(
+                "trace contains no inter-token latency data (all records are single-token \
+                 outputs); cannot pace decode from it"
+            );
+        }
+
+        Ok(TraceLatency {
+            grid,
+            itl_by_concurrency,
+            kv_transfer_fallback,
+            meta,
+        })
+    }
+}
+
+/// Sample from sorted samples using inverse CDF: draw u in [0,1), interpolate.
+fn sample_inverse_cdf(rng: &mut StdRng, samples: &[f64]) -> f64 {
+    debug_assert!(!samples.is_empty());
+    if samples.len() == 1 {
+        return samples[0];
+    }
+    let u: f64 = rng.random::<f64>();
+    let pos = u * (samples.len() - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = (lo + 1).min(samples.len() - 1);
+    let frac = pos - lo as f64;
+    samples[lo] * (1.0 - frac) + samples[hi] * frac
+}
+
+/// Find the nearest non-empty cell by Manhattan distance on bucket indices, preferring
+/// the same prompt bucket (tie-break). Returns None only if the entire grid is empty
+/// (which from_records prevents).
+fn nearest_ttft(grid: &[Vec<Cell>], pb: usize, cb: usize) -> Option<&[f64]> {
+    if !grid[pb][cb].ttft_samples.is_empty() {
+        return Some(&grid[pb][cb].ttft_samples);
+    }
+    let mut best: Option<(usize, usize, usize)> = None; // (distance, prompt_dist, indices)
+    for (pi, row) in grid.iter().enumerate() {
+        for (ci, cell) in row.iter().enumerate() {
+            if cell.ttft_samples.is_empty() {
+                continue;
+            }
+            let pd = pi.abs_diff(pb);
+            let cd = ci.abs_diff(cb);
+            let dist = pd + cd;
+            match best {
+                None => best = Some((dist, pd, pi * NUM_CONCURRENCY_BUCKETS + ci)),
+                Some((bd, bpd, _)) => {
+                    if dist < bd || (dist == bd && pd < bpd) {
+                        best = Some((dist, pd, pi * NUM_CONCURRENCY_BUCKETS + ci));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, _, idx)| {
+        let pi = idx / NUM_CONCURRENCY_BUCKETS;
+        let ci = idx % NUM_CONCURRENCY_BUCKETS;
+        grid[pi][ci].ttft_samples.as_slice()
+    })
+}
+
+/// Find nearest non-empty ITL concurrency bucket.
+fn nearest_itl(itl_by_concurrency: &[Vec<f64>], cb: usize) -> Option<&[f64]> {
+    if !itl_by_concurrency[cb].is_empty() {
+        return Some(&itl_by_concurrency[cb]);
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for (ci, samples) in itl_by_concurrency.iter().enumerate() {
+        if samples.is_empty() {
+            continue;
+        }
+        let dist = ci.abs_diff(cb);
+        match best {
+            None => best = Some((dist, ci)),
+            Some((bd, _)) if dist < bd => best = Some((dist, ci)),
+            _ => {}
+        }
+    }
+    best.map(|(_, ci)| itl_by_concurrency[ci].as_slice())
+}
+
+impl LatencyModel for TraceLatency {
+    fn first_token_delay(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
+        if ctx.do_remote_prefill {
+            return self.kv_transfer_fallback.first_token_delay(rng, ctx);
+        }
+
+        let uncached = ctx.num_prompt_tokens.saturating_sub(ctx.num_cached_tokens);
+        let pb = prompt_bucket(uncached);
+        let cb = concurrency_bucket(ctx.num_running);
+
+        // from_records rejects traces with no records, so some cell is non-empty and the
+        // nearest-cell search always resolves; the zero fallback is unreachable belt-and-braces.
+        let Some(samples) = nearest_ttft(&self.grid, pb, cb) else {
+            return Duration::ZERO;
+        };
+        let ms = sample_inverse_cdf(rng, samples);
+        Duration::from_secs_f64(ms / 1000.0)
+    }
+
+    fn inter_token_delay(&self, rng: &mut StdRng, num_running: u64) -> Duration {
+        let cb = concurrency_bucket(num_running);
+        // from_records rejects traces with no ITL data, so some bucket is non-empty.
+        let Some(samples) = nearest_itl(&self.itl_by_concurrency, cb) else {
+            return Duration::ZERO;
+        };
+        let ms = sample_inverse_cdf(rng, samples);
+        Duration::from_secs_f64(ms / 1000.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng as _;
@@ -326,5 +566,206 @@ mod tests {
                 std::time::Duration::from_millis(7),
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // TraceLatency tests
+    // -----------------------------------------------------------------------
+
+    use crate::latency::TraceLatency;
+    use crate::trace::{ItlSummary, TraceMeta, TraceRecord};
+
+    fn zero_knob() -> KnobLatency {
+        model()
+    }
+
+    fn make_record(
+        prompt: usize,
+        output: usize,
+        ttft: f64,
+        itl: Vec<f64>,
+        conc: u64,
+    ) -> TraceRecord {
+        TraceRecord {
+            prompt_tokens: prompt,
+            cached_tokens: 0,
+            output_tokens: output,
+            ttft_ms: ttft,
+            itl_ms: if itl.is_empty() { None } else { Some(itl) },
+            itl_summary: None,
+            concurrency: conc,
+        }
+    }
+
+    #[test]
+    fn trace_empty_records_is_error() {
+        let result = TraceLatency::from_records(TraceMeta::default(), &[], zero_knob());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn trace_constant_ttft_reproduces_exactly() {
+        // All records in the same bucket have the same TTFT; sampling must return it exactly.
+        let records = vec![
+            make_record(50, 2, 42.0, vec![9.0], 1),
+            make_record(60, 1, 42.0, vec![], 1),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        for _ in 0..100 {
+            let d = trace.first_token_delay(&mut rng, &ctx(55, 0, false, 1));
+            assert_eq!(d, std::time::Duration::from_secs_f64(0.042));
+        }
+    }
+
+    #[test]
+    fn trace_samples_stay_within_min_max() {
+        let records = vec![
+            make_record(50, 3, 10.0, vec![5.0, 15.0], 1),
+            make_record(60, 3, 20.0, vec![8.0, 12.0], 1),
+            make_record(40, 3, 15.0, vec![6.0, 10.0], 1),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..1000 {
+            let ttft = trace.first_token_delay(&mut rng, &ctx(50, 0, false, 1));
+            let ms = ttft.as_secs_f64() * 1000.0;
+            assert!(
+                (10.0 - 0.001..=20.0 + 0.001).contains(&ms),
+                "ttft out of range: {ms}"
+            );
+
+            let itl = trace.inter_token_delay(&mut rng, 1);
+            let ms = itl.as_secs_f64() * 1000.0;
+            assert!(
+                (5.0 - 0.001..=15.0 + 0.001).contains(&ms),
+                "itl out of range: {ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_determinism_same_seed() {
+        let records = vec![
+            make_record(100, 5, 25.0, vec![3.0, 4.0, 5.0, 6.0], 2),
+            make_record(120, 3, 35.0, vec![7.0, 8.0], 2),
+        ];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+
+        let run = |seed: u64| {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut results = Vec::new();
+            for _ in 0..20 {
+                results.push(trace.first_token_delay(&mut rng, &ctx(110, 0, false, 2)));
+                results.push(trace.inter_token_delay(&mut rng, 2));
+            }
+            results
+        };
+
+        assert_eq!(
+            run(42),
+            run(42),
+            "same seed must produce identical sequence"
+        );
+        assert_ne!(
+            run(42),
+            run(99),
+            "different seeds should produce different sequences"
+        );
+    }
+
+    #[test]
+    fn trace_fallback_to_nearest_bucket() {
+        // Only populate a single cell in the grid: prompt bucket 0 (0-64), concurrency bucket 0 (1).
+        let records = vec![make_record(30, 2, 77.0, vec![11.0], 1)];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+
+        // Query a very different bucket (large prompt, high concurrency). Should fall back
+        // to the only populated cell.
+        let d = trace.first_token_delay(&mut rng, &ctx(10000, 0, false, 50));
+        assert_eq!(d, std::time::Duration::from_secs_f64(0.077));
+
+        let itl = trace.inter_token_delay(&mut rng, 50);
+        assert_eq!(itl, std::time::Duration::from_secs_f64(0.011));
+    }
+
+    #[test]
+    fn trace_itl_summary_expansion() {
+        // Use itl_summary instead of itl_ms; verify it expands correctly.
+        let records = vec![TraceRecord {
+            prompt_tokens: 50,
+            cached_tokens: 0,
+            output_tokens: 6,
+            ttft_ms: 20.0,
+            itl_ms: None,
+            itl_summary: Some(ItlSummary {
+                mean_ms: 9.0,
+                count: 5,
+            }),
+            concurrency: 1,
+        }];
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+
+        // All ITL samples are 9.0, so sampling always returns 9.0.
+        for _ in 0..50 {
+            let itl = trace.inter_token_delay(&mut rng, 1);
+            assert_eq!(itl, std::time::Duration::from_secs_f64(0.009));
+        }
+    }
+
+    #[test]
+    fn trace_without_itl_data_is_rejected() {
+        // Single-token outputs carry no decode pacing data; the model must refuse to build
+        // rather than silently replay instant inter-token times.
+        let records = vec![
+            make_record(50, 1, 42.0, vec![], 1),
+            make_record(60, 1, 42.0, vec![], 1),
+        ];
+        let result = TraceLatency::from_records(TraceMeta::default(), &records, zero_knob());
+        let error = result.err().expect("ITL-less trace must be rejected");
+        assert!(error.to_string().contains("inter-token"), "got: {error}");
+    }
+
+    #[test]
+    fn trace_remote_prefill_delegates_to_knob() {
+        let records = vec![make_record(50, 2, 10.0, vec![1.0], 1)];
+        let mut knob = zero_knob();
+        knob.kv_cache_transfer_latency = 500;
+        let trace = TraceLatency::from_records(TraceMeta::default(), &records, knob).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+
+        let d = trace.first_token_delay(&mut rng, &ctx(50, 0, true, 1));
+        assert_eq!(d, std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn prompt_bucket_edges() {
+        use crate::latency::prompt_bucket;
+        assert_eq!(prompt_bucket(0), 0);
+        assert_eq!(prompt_bucket(64), 0);
+        assert_eq!(prompt_bucket(65), 1);
+        assert_eq!(prompt_bucket(128), 1);
+        assert_eq!(prompt_bucket(129), 2);
+        assert_eq!(prompt_bucket(50000), 10); // last bucket
+    }
+
+    #[test]
+    fn concurrency_bucket_edges() {
+        use crate::latency::concurrency_bucket;
+        assert_eq!(concurrency_bucket(1), 0);
+        assert_eq!(concurrency_bucket(2), 1);
+        assert_eq!(concurrency_bucket(4), 1);
+        assert_eq!(concurrency_bucket(5), 2);
+        assert_eq!(concurrency_bucket(8), 2);
+        assert_eq!(concurrency_bucket(9), 3);
+        assert_eq!(concurrency_bucket(65), 6);
+        assert_eq!(concurrency_bucket(1000), 6);
     }
 }

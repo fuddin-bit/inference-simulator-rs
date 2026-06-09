@@ -1209,7 +1209,11 @@ impl SimEngine {
 impl SimEngine {
     /// Build a fully-initialized engine. KV-event publishing is async (ZMQ bind), so
     /// construction is async too. The caller owns the loop; see `core::run_loop`.
-    pub(crate) async fn new(engine_index: u32, opt: Opt, events: Option<KvEventTx>) -> SimEngine {
+    pub(crate) async fn new(
+        engine_index: u32,
+        opt: Opt,
+        events: Option<KvEventTx>,
+    ) -> Result<SimEngine> {
         let role = opt.pd_role;
         let cfg = NixlConfig {
             kv_block_bytes: opt.kv_block_bytes,
@@ -1219,7 +1223,7 @@ impl SimEngine {
             side_channel_host: opt.side_channel_host.clone(),
             side_channel_port: opt.side_channel_port + engine_index,
         };
-        let latency: Box<dyn LatencyModel> = Box::new(opt.latency_model());
+        let latency: Box<dyn LatencyModel> = opt.build_latency()?;
         let token_source: Box<dyn TokenSource> = Box::new(RandomTokens {
             vocab_size: opt.vocab_size,
         });
@@ -1235,7 +1239,7 @@ impl SimEngine {
             opt.kv_cache_none_seed,
         );
         let (pull_completion_tx, pull_completion_rx) = mpsc::unbounded_channel();
-        SimEngine {
+        Ok(SimEngine {
             engine_index,
             opt,
             latency,
@@ -1253,7 +1257,7 @@ impl SimEngine {
             pending_pulls: HashMap::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
-        }
+        })
     }
 }
 
@@ -1321,7 +1325,7 @@ mod tests {
             opt.kv_cache_size as usize,
             opt.kv_cache_none_seed,
         );
-        let latency: Box<dyn crate::latency::LatencyModel> = Box::new(opt.latency_model());
+        let latency: Box<dyn crate::latency::LatencyModel> = opt.build_latency().unwrap();
         let token_source: Box<dyn crate::tokens::TokenSource> =
             Box::new(crate::tokens::RandomTokens {
                 vocab_size: opt.vocab_size,

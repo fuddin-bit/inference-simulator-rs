@@ -1,0 +1,282 @@
+//! End-to-end integration test for the engine-core recording tap.
+//!
+//! Topology (no GPUs, no real vLLM):
+//!
+//! ```text
+//!   EngineCoreClient (acts as "real frontend")
+//!       |
+//!       v
+//!   inference-sim-tap  (the binary under test)
+//!       |
+//!       v
+//!   inference_simulator_rs::run (acts as "real engine")
+//! ```
+//!
+//! The test drives 2-3 normal requests plus one aborted request through the
+//! full chain and asserts:
+//!   - Tokens arrive at the client with the correct count and Length finish.
+//!   - The trace file contains one record per finished request.
+//!   - Each record has correct prompt_tokens, output_tokens, ttft_ms > 0,
+//!     and itl_ms count == output_tokens - 1 (chunk size 1).
+//!   - The aborted request does NOT appear in the trace.
+
+use std::io::BufReader;
+use std::process::Command;
+use std::time::Duration;
+
+use futures::StreamExt;
+use tokio_util::sync::CancellationToken;
+
+use inference_simulator_rs::trace::{TraceRecord, read_trace};
+use inference_simulator_rs::{Opt, run};
+
+use clap::Parser as _;
+use vllm_engine_core_client::protocol::{
+    EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams,
+};
+use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
+
+const TIMEOUT: Duration = Duration::from_secs(15);
+
+fn make_request(id: &str, prompt_len: usize, max_tokens: u32) -> EngineCoreRequest {
+    EngineCoreRequest {
+        request_id: id.to_string(),
+        prompt_token_ids: Some(vec![42u32; prompt_len]),
+        sampling_params: Some(EngineCoreSamplingParams {
+            max_tokens,
+            ..EngineCoreSamplingParams::for_test()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Spin up the simulator as the "real engine" that the tap will connect to.
+/// Returns a guard that cancels on drop.
+async fn start_sim(handshake_address: &str) -> CancellationToken {
+    let args = vec![
+        "inference-sim",
+        "--handshake-address",
+        handshake_address,
+        "--inter-token-latency",
+        "30",
+    ];
+    let opt = Opt::parse_from(&args);
+    let token = CancellationToken::new();
+    let sim_token = token.clone();
+    tokio::spawn(async move {
+        let _ = run(opt, sim_token).await;
+    });
+    token
+}
+
+#[tokio::test]
+async fn tap_records_trace() {
+    let pid = std::process::id();
+
+    // Unique IPC endpoints scoped by pid.
+    let frontend_handshake = format!("ipc:///tmp/tap-e2e-frontend-{pid}.ipc");
+    let tap_engine_handshake = format!("ipc:///tmp/tap-e2e-engine-{pid}.ipc");
+    let tap_input = format!("ipc:///tmp/tap-e2e-input-{pid}.ipc");
+    let tap_output = format!("ipc:///tmp/tap-e2e-output-{pid}.ipc");
+    let trace_path = format!("/tmp/tap-e2e-trace-{pid}.jsonl");
+
+    // Clean up leftover IPC files from prior runs.
+    for path in [
+        &frontend_handshake,
+        &tap_engine_handshake,
+        &tap_input,
+        &tap_output,
+    ] {
+        if let Some(p) = path.strip_prefix("ipc://") {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    let _ = std::fs::remove_file(&trace_path);
+
+    // Step 1: Start the tap binary. It will bind the upstream side first, then
+    // connect downstream. The tap binary path comes from CARGO_BIN_EXE.
+    let tap_bin = env!("CARGO_BIN_EXE_inference-sim-tap");
+    let mut tap_child = Command::new(tap_bin)
+        .arg("--frontend-handshake")
+        .arg(&frontend_handshake)
+        .arg("--engine-handshake")
+        .arg(&tap_engine_handshake)
+        .arg("--input-address")
+        .arg(&tap_input)
+        .arg("--output-address")
+        .arg(&tap_output)
+        .arg("--trace-out")
+        .arg(&trace_path)
+        .arg("--model")
+        .arg("test-model")
+        .env("RUST_LOG", "info")
+        .spawn()
+        .expect("failed to spawn inference-sim-tap");
+
+    // Give the tap a moment to bind its upstream sockets.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Step 2: Start the simulator as the "real engine", connecting to the tap's
+    // engine handshake address.
+    let sim_token = start_sim(&tap_engine_handshake).await;
+
+    // Give the sim a moment to connect to the tap.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Step 3: Connect the EngineCoreClient to the tap's frontend-facing side.
+    // The tap connects to this address as an engine.
+    let config = EngineCoreClientConfig::new_single(&frontend_handshake);
+    let client = tokio::time::timeout(Duration::from_secs(30), EngineCoreClient::connect(config))
+        .await
+        .expect("client connect timed out")
+        .expect("client connect failed");
+
+    // Step 4: Send requests through the chain.
+
+    // Request 1: 10 prompt tokens, 5 output tokens.
+    let req1 = make_request("tap-req-1", 10, 5);
+    let stream1 = client.call(req1).await.expect("call 1 failed");
+    let outputs1: Vec<_> = tokio::time::timeout(TIMEOUT, stream1.collect::<Vec<_>>())
+        .await
+        .expect("stream 1 timed out");
+    let total1: usize = outputs1
+        .iter()
+        .map(|r| r.as_ref().expect("output error").new_token_ids.len())
+        .sum();
+    assert_eq!(total1, 5, "request 1 should produce 5 tokens");
+    let last1 = outputs1.last().unwrap().as_ref().unwrap();
+    assert_eq!(last1.finish_reason, Some(EngineCoreFinishReason::Length));
+
+    // Request 2: 20 prompt tokens, 3 output tokens.
+    let req2 = make_request("tap-req-2", 20, 3);
+    let stream2 = client.call(req2).await.expect("call 2 failed");
+    let outputs2: Vec<_> = tokio::time::timeout(TIMEOUT, stream2.collect::<Vec<_>>())
+        .await
+        .expect("stream 2 timed out");
+    let total2: usize = outputs2
+        .iter()
+        .map(|r| r.as_ref().expect("output error").new_token_ids.len())
+        .sum();
+    assert_eq!(total2, 3, "request 2 should produce 3 tokens");
+    let last2 = outputs2.last().unwrap().as_ref().unwrap();
+    assert_eq!(last2.finish_reason, Some(EngineCoreFinishReason::Length));
+
+    // Request 3 (aborted): large max_tokens, abort after first output.
+    let req3 = make_request("tap-req-abort", 4, 10000);
+    let mut stream3 = client.call(req3).await.expect("call 3 failed");
+    let first3 = tokio::time::timeout(TIMEOUT, stream3.next())
+        .await
+        .expect("first output timed out")
+        .expect("stream ended")
+        .expect("output error");
+    assert_eq!(first3.request_id, "tap-req-abort");
+    client
+        .abort(&["tap-req-abort".to_string()])
+        .await
+        .expect("abort failed");
+    // Drain remaining outputs.
+    let _remaining: Vec<_> = tokio::time::timeout(TIMEOUT, stream3.collect::<Vec<_>>())
+        .await
+        .expect("remaining stream timed out");
+
+    // Request 4: one more to make sure the tap is still working after an abort.
+    let req4 = make_request("tap-req-3", 15, 4);
+    let stream4 = client.call(req4).await.expect("call 4 failed");
+    let outputs4: Vec<_> = tokio::time::timeout(TIMEOUT, stream4.collect::<Vec<_>>())
+        .await
+        .expect("stream 4 timed out");
+    let total4: usize = outputs4
+        .iter()
+        .map(|r| r.as_ref().expect("output error").new_token_ids.len())
+        .sum();
+    assert_eq!(total4, 4, "request 3 should produce 4 tokens");
+
+    // Step 5: Shut down the simulator and tap.
+    sim_token.cancel();
+    // Give the sim a moment to shut down so the tap sees the connection drop.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Kill the tap process.
+    let _ = tap_child.kill();
+    let _ = tap_child.wait();
+
+    // Step 6: Read and validate the trace file.
+    let file = std::fs::File::open(&trace_path).expect("trace file should exist");
+    let reader = BufReader::new(file);
+    let (meta, records) = read_trace(reader).expect("trace should be valid JSONL");
+
+    // Meta line.
+    assert_eq!(meta.source.as_deref(), Some("tap"));
+    assert_eq!(meta.model.as_deref(), Some("test-model"));
+
+    // Should have exactly 3 records (the abort should NOT be present).
+    assert_eq!(
+        records.len(),
+        3,
+        "expected 3 trace records (no aborted request), got {}",
+        records.len()
+    );
+
+    // Validate each record.
+    let record_by_prompt: std::collections::HashMap<usize, &TraceRecord> =
+        records.iter().map(|r| (r.prompt_tokens, r)).collect();
+
+    // Request 1: 10 prompt, 5 output.
+    let r1 = record_by_prompt
+        .get(&10)
+        .expect("should have record with 10 prompt tokens");
+    assert_eq!(r1.output_tokens, 5);
+    assert!(
+        r1.ttft_ms > 0.0,
+        "ttft_ms should be > 0, got {}",
+        r1.ttft_ms
+    );
+    let itl1 = r1.itl_ms.as_ref().expect("should have itl_ms");
+    assert_eq!(
+        itl1.len(),
+        4,
+        "itl_ms count should be output_tokens - 1 = 4, got {}",
+        itl1.len()
+    );
+    assert!(r1.concurrency >= 1, "concurrency should be >= 1");
+
+    // Request 2: 20 prompt, 3 output.
+    let r2 = record_by_prompt
+        .get(&20)
+        .expect("should have record with 20 prompt tokens");
+    assert_eq!(r2.output_tokens, 3);
+    assert!(r2.ttft_ms > 0.0);
+    let itl2 = r2.itl_ms.as_ref().expect("should have itl_ms");
+    assert_eq!(
+        itl2.len(),
+        2,
+        "itl_ms count should be 2, got {}",
+        itl2.len()
+    );
+
+    // Request 3: 15 prompt, 4 output.
+    let r3 = record_by_prompt
+        .get(&15)
+        .expect("should have record with 15 prompt tokens");
+    assert_eq!(r3.output_tokens, 4);
+    assert!(r3.ttft_ms > 0.0);
+    let itl3 = r3.itl_ms.as_ref().expect("should have itl_ms");
+    assert_eq!(
+        itl3.len(),
+        3,
+        "itl_ms count should be 3, got {}",
+        itl3.len()
+    );
+
+    // Clean up.
+    let _ = std::fs::remove_file(&trace_path);
+    for path in [
+        &frontend_handshake,
+        &tap_engine_handshake,
+        &tap_input,
+        &tap_output,
+    ] {
+        if let Some(p) = path.strip_prefix("ipc://") {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
