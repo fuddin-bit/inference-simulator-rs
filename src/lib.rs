@@ -22,6 +22,7 @@ use vllm_engine_core_client::mock_engine::{
 use vllm_engine_core_client::protocol::EngineCoreFinishReason;
 
 pub mod blockpool;
+pub mod calibrate;
 pub mod dataplane;
 mod engine;
 mod engine_core;

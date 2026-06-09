@@ -126,7 +126,7 @@ fn scale(millis: u64, load: f64) -> u64 {
 
 /// Sample a normal deviate via the Box-Muller transform. Returns `mean` exactly when
 /// `stddev == 0` (matching upstream, and keeping the zero-config path deterministic).
-fn random_norm(rng: &mut StdRng, mean: f64, stddev: f64) -> f64 {
+pub(crate) fn random_norm(rng: &mut StdRng, mean: f64, stddev: f64) -> f64 {
     if stddev == 0.0 {
         return mean;
     }
@@ -177,7 +177,7 @@ const PROMPT_EDGES: &[usize] = &[0, 65, 129, 257, 513, 1025, 2049, 4097, 8193, 1
 const NUM_PROMPT_BUCKETS: usize = PROMPT_EDGES.len();
 
 /// Map an uncached prompt token count to a bucket index.
-fn prompt_bucket(uncached_prompt_tokens: usize) -> usize {
+pub fn prompt_bucket(uncached_prompt_tokens: usize) -> usize {
     // Find the last edge the value is >= to.
     let mut bucket = 0;
     for (i, &edge) in PROMPT_EDGES.iter().enumerate() {
@@ -191,7 +191,7 @@ fn prompt_bucket(uncached_prompt_tokens: usize) -> usize {
 }
 
 /// Concurrency bucket boundaries. A concurrency value maps to the first range it fits in.
-const CONCURRENCY_RANGES: &[(u64, u64)] = &[
+pub const CONCURRENCY_RANGES: &[(u64, u64)] = &[
     (1, 1),
     (2, 4),
     (5, 8),
@@ -201,9 +201,9 @@ const CONCURRENCY_RANGES: &[(u64, u64)] = &[
     (65, u64::MAX),
 ];
 
-const NUM_CONCURRENCY_BUCKETS: usize = 7;
+pub const NUM_CONCURRENCY_BUCKETS: usize = 7;
 
-fn concurrency_bucket(concurrency: u64) -> usize {
+pub fn concurrency_bucket(concurrency: u64) -> usize {
     for (i, &(lo, hi)) in CONCURRENCY_RANGES.iter().enumerate() {
         if concurrency >= lo && concurrency <= hi {
             return i;
@@ -307,7 +307,7 @@ impl TraceLatency {
 }
 
 /// Sample from sorted samples using inverse CDF: draw u in [0,1), interpolate.
-fn sample_inverse_cdf(rng: &mut StdRng, samples: &[f64]) -> f64 {
+pub(crate) fn sample_inverse_cdf(rng: &mut StdRng, samples: &[f64]) -> f64 {
     debug_assert!(!samples.is_empty());
     if samples.len() == 1 {
         return samples[0];

@@ -167,3 +167,43 @@ Unit tests in `src/engine.rs` cover engine internals at a finer grain.
   (stub) and in the container (real lib).
 
 The binary is `inference-sim`; the k8s deployment lives in `deploy/llm-d-pd/`.
+
+## Trace replay and calibration
+
+The `inference-sim-trace` binary includes a calibration harness that proves two
+claims about the latency models:
+
+1. **TraceLatency replay reproduces source trace quantiles** within tolerance.
+2. **KnobLatency structurally cannot reproduce heavy tails**: its `[0.3*mean, 1.7*mean]`
+   clamp caps p99/p50 at roughly 1.7x for any knob settings.
+
+Three-command demo:
+
+```bash
+# 1. Generate a synthetic heavy-tailed trace (lognormal TTFT/ITL).
+cargo run --bin inference-sim-trace -- gen-demo -o /tmp/demo.jsonl
+
+# 2. Model-level calibration (no transport, fast, exact).
+cargo run --bin inference-sim-trace -- calibrate /tmp/demo.jsonl
+
+# 3. Wire-level proof: spin the real simulator and measure client-side.
+cargo run --bin inference-sim-trace -- calibrate-e2e /tmp/demo.jsonl --requests 60
+```
+
+Example verdict from the demo trace (seed 0, 200 records, 100k samples):
+
+```
+=== Verdict ===
+Pooled p99/p50 ratios:
+  source   TTFT=11.507  ITL=6.299
+  replay   TTFT=11.997  ITL=6.308
+  knob-fit TTFT=1.700  ITL=1.700
+
+Replay max relative error: TTFT=0.0419  ITL=0.0046
+Replay PASS (tolerance 0.10): PASS
+Knob-fit tail capped at ~1.7x by construction (source TTFT ratio 11.507 > 1.75, knob-fit 1.700 <= 1.75)
+```
+
+Use `--fast` on `gen-demo` to produce a small-magnitude trace suitable for
+quick e2e testing (TTFT ~15-40ms, ITL ~3-10ms). All subcommands accept `--json`
+for machine-readable output and `--seed` for determinism.
