@@ -96,3 +96,31 @@ capture-up-nocache:
     kubectl -n {{namespace}} patch deploy {{deploy}} --type=json \
         -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--no-enable-prefix-caching"}]'
     kubectl -n {{namespace}} scale deploy {{deploy}} --replicas=1
+
+# --- kueue validation jobs ----------------------------------------------------------
+
+# Queue the counterfactual-validation capture jobs (cached + nocache) on Kueue.
+validation-up:
+    kubectl create configmap validation-scripts -n {{namespace}} \
+        --from-file=loadgen.py=deploy/trace-capture/loadgen.py \
+        --from-file=runner.sh=deploy/trace-capture/validation-runner.sh \
+        --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -f deploy/trace-capture/validation-jobs.yaml
+
+# Admission + pod + loadgen status for the validation jobs.
+validation-status:
+    kubectl -n {{namespace}} get workloads
+    kubectl -n {{namespace}} get jobs -l llm-d.ai/guide=trace-capture
+    kubectl -n {{namespace}} get pods -l llm-d.ai/guide=trace-capture
+    -kubectl -n {{namespace}} logs -l llm-d.ai/guide=trace-capture -c loadgen --tail=2 --prefix
+
+# Fetch a job's tap trace and release it (job completes, GPU freed).
+validation-fetch job out:
+    kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- cat /trace/trace.jsonl > {{out}}
+    -kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- sh -c 'for f in /trace/marker-*; do echo "$f=$(cat $f)"; done'
+    kubectl -n {{namespace}} exec job/{{job}} -c loadgen -- touch /trace/fetched
+    @wc -l {{out}}
+
+# Delete the validation jobs (frees quota immediately).
+validation-down:
+    -kubectl -n {{namespace}} delete -f deploy/trace-capture/validation-jobs.yaml
