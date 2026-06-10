@@ -34,7 +34,7 @@ for phase in $PHASES; do
     sweep)
         # ~1.54 wire tokens per synthetic word: spans ~0.8k-12.3k tokens across
         # the latency model's prompt buckets, at idle and loaded concurrency.
-        for words in 512 1000 1500 3000 5500 8000; do
+        for words in ${SWEEP_WORDS:-512 1000 1500 3000 5500 8000}; do
             echo "==> sweep prompt=$words words c1 (45s)"
             loadgen --pattern constant --concurrency 1 --duration 45 \
                 --prompt-tokens "$words" --output-tokens 128 \

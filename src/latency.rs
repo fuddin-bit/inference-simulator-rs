@@ -44,9 +44,20 @@ pub struct DecodePacing {
     /// draw: prompt tokens of a request admitted to prefill. Consumed by the
     /// next draw, which samples the stall distribution instead of the clean one.
     pending_stall: Option<u32>,
+    /// Prompt bucket of this request's full context, conditioning decode gaps
+    /// on KV depth (attention over a long context slows every step).
+    context_bucket: usize,
 }
 
 impl DecodePacing {
+    /// Pacing state for a request whose full context is `prompt_tokens` long.
+    pub fn for_prompt(prompt_tokens: usize) -> Self {
+        Self {
+            context_bucket: prompt_bucket(prompt_tokens),
+            ..Self::default()
+        }
+    }
+
     /// Note that the engine admitted a prefill of `prompt_tokens` while this
     /// request decodes. A real prefill blocks one engine step, spiking exactly
     /// one gap per concurrent decode request, so the flag is consumed by a
@@ -61,6 +72,7 @@ impl Default for DecodePacing {
         Self {
             donors: [None; NUM_CONCURRENCY_BUCKETS],
             pending_stall: None,
+            context_bucket: 0,
         }
     }
 }
@@ -265,13 +277,6 @@ pub fn concurrency_label(bucket: usize) -> String {
     }
 }
 
-/// A grid cell holding sorted TTFT samples and pooled ITL samples.
-#[derive(Debug, Clone, Default)]
-struct Cell {
-    ttft_samples: Vec<f64>,
-    itl_samples: Vec<f64>,
-}
-
 /// One source request's gap distribution, used as a pacing donor.
 #[derive(Debug, Clone)]
 struct Donor {
@@ -280,8 +285,8 @@ struct Donor {
     gaps: Vec<f64>,
 }
 
-/// Per-concurrency-bucket donor pool with token-count weighting, so the marginal
-/// per-token distribution of hierarchical sampling matches the pooled samples.
+/// Donor pool with token-count weighting, so the marginal per-token
+/// distribution of hierarchical sampling matches the pooled samples.
 #[derive(Debug, Clone, Default)]
 struct DonorBucket {
     donors: Vec<Donor>,
@@ -307,23 +312,47 @@ impl DonorBucket {
     }
 }
 
-/// Replay latency model: samples timing from a grid of recorded observations, bucketed
-/// by (uncached prompt tokens, concurrency). For `do_remote_prefill` requests where the
-/// trace has no transfer-time data, falls back to a wrapped `KnobLatency` for KV-transfer
-/// timing only.
+/// First-token service-time samples for one uncached-prompt bucket: the
+/// observations from the bucket's lowest captured concurrency, where the queue
+/// behind them was empty (or as close to it as the capture got).
+#[derive(Debug, Clone)]
+struct ServiceCell {
+    /// Sorted TTFT samples (ms) from the lowest-concurrency observations.
+    samples: Vec<f64>,
+    /// Median uncached prompt tokens behind those samples, the anchor for
+    /// linear-in-tokens scaling when another bucket borrows them.
+    median_uncached: f64,
+}
+
+/// Replay latency model fit from recorded observations.
+///
+/// The decomposition matters: `first_token_delay` is prefill SERVICE time
+/// (fit from each prompt bucket's lowest-concurrency captures, where TTFT
+/// carries no queueing), and all waiting comes from the simulated scheduler
+/// (admission against the batched-token budget, prefill stalls on concurrent
+/// decodes). Fitting raw loaded TTFTs as the park time double-counts the
+/// queue: the sample embeds the capture's queueing and the sim queues again
+/// on top, which is exactly how the H200 counterfactual validation failed.
+///
+/// Decode gaps are conditioned on (context bucket, concurrency bucket):
+/// attention over a long context slows every step, so an 11k-context decode
+/// must not draw gaps captured at 800 tokens. Prefill-interference stalls are
+/// conditioned on the admitted chunk's size bucket for the same reason.
 pub struct TraceLatency {
-    /// Grid indexed by [prompt_bucket][concurrency_bucket].
-    grid: Vec<Vec<Cell>>,
-    /// Pooled ITL samples per concurrency bucket (union over all prompt buckets).
+    /// First-token service time per uncached-prompt bucket.
+    service_by_prompt: Vec<Option<ServiceCell>>,
+    /// Pooled ITL samples per concurrency bucket (marginal fallback for
+    /// un-paced callers).
     itl_by_concurrency: Vec<Vec<f64>>,
-    /// Per-request donor pools per concurrency bucket, for hierarchical pacing.
-    /// When the trace carries `itl_ctx`, donors hold only CLEAN gaps (no prefill
-    /// in the step); prefill-interfered gaps go to `stalls_by_concurrency`.
-    donors_by_concurrency: Vec<DonorBucket>,
-    /// Sorted prefill-interfered gap samples per concurrency bucket, drawn when
-    /// the engine notes a prefill admission on the request's pacing state. Empty
-    /// for traces without `itl_ctx`.
-    stalls_by_concurrency: Vec<Vec<f64>>,
+    /// Per-request donor pools, indexed by [context bucket][concurrency bucket].
+    /// When the trace carries `itl_ctx`, donors hold only CLEAN gaps; the
+    /// prefill-interfered gaps feed `stalls_grid`.
+    donors_grid: Vec<Vec<DonorBucket>>,
+    /// Sorted prefill-interfered gap samples, indexed by
+    /// [prefill-size bucket][concurrency bucket], drawn when the engine notes
+    /// a prefill admission on the request's pacing state. Empty for traces
+    /// without `itl_ctx`.
+    stalls_grid: Vec<Vec<Vec<f64>>>,
     /// Fallback for do_remote_prefill KV-transfer timing (the trace does not record
     /// transfer latencies from disaggregated decode pulls).
     kv_transfer_fallback: KnobLatency,
@@ -332,8 +361,8 @@ pub struct TraceLatency {
 }
 
 impl TraceLatency {
-    /// Build from parsed trace records. Bins records into the prompt x concurrency grid.
-    /// Returns an error if the trace has no records.
+    /// Build from parsed trace records. Returns an error if the trace has no
+    /// records or no decode-pacing data.
     pub fn from_records(
         meta: TraceMeta,
         records: &[TraceRecord],
@@ -343,31 +372,34 @@ impl TraceLatency {
             anyhow::bail!("trace has no records; cannot build a replay latency model");
         }
 
-        let mut grid = vec![vec![Cell::default(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
-        let mut donors_by_concurrency = vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS];
-        let mut stalls_by_concurrency = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
+        // Per uncached-prompt bucket: (concurrency bucket, uncached tokens, ttft).
+        let mut ttft_obs: Vec<Vec<(usize, f64, f64)>> = vec![Vec::new(); NUM_PROMPT_BUCKETS];
+        let mut donors_grid =
+            vec![vec![DonorBucket::default(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
+        let mut stalls_grid = vec![vec![Vec::new(); NUM_CONCURRENCY_BUCKETS]; NUM_PROMPT_BUCKETS];
+        let mut itl_by_concurrency = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
 
         for record in records {
             let uncached = record.prompt_tokens.saturating_sub(record.cached_tokens);
-            let pb = prompt_bucket(uncached);
+            let upb = prompt_bucket(uncached);
+            // Decode cost scales with the FULL context the step attends over,
+            // cached or not.
+            let ctx_pb = prompt_bucket(record.prompt_tokens);
             let cb = concurrency_bucket(record.concurrency);
-            let cell = &mut grid[pb][cb];
 
-            cell.ttft_samples.push(record.ttft_ms);
+            ttft_obs[upb].push((cb, uncached.max(1) as f64, record.ttft_ms));
 
-            // Expand ITL: prefer the array, fall back to the summary. Each record
-            // also becomes a pacing donor weighted by its token count. With per-gap
-            // context, prefill-interfered gaps leave the donor pool and feed the
-            // stall distribution instead, so replay re-adds them only when the
-            // simulated scheduler actually creates the interference.
             if let Some(itls) = &record.itl_ms {
                 if !itls.is_empty() {
-                    cell.itl_samples.extend(itls.iter().copied());
+                    itl_by_concurrency[cb].extend(itls.iter().copied());
                     let mut gaps: Vec<f64> = match &record.itl_ctx {
                         Some(ctx) => {
                             let (stalled, clean): (Vec<usize>, Vec<usize>) =
                                 (0..itls.len()).partition(|&i| ctx.prefill_tokens[i] > 0);
-                            stalls_by_concurrency[cb].extend(stalled.iter().map(|&i| itls[i]));
+                            for &i in &stalled {
+                                let ppb = prompt_bucket(ctx.prefill_tokens[i] as usize);
+                                stalls_grid[ppb][cb].push(itls[i]);
+                            }
                             clean.iter().map(|&i| itls[i]).collect()
                         }
                         None => itls.clone(),
@@ -375,16 +407,16 @@ impl TraceLatency {
                     if !gaps.is_empty() {
                         gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         let weight = gaps.len() as f64;
-                        donors_by_concurrency[cb].push(Donor { gaps }, weight);
+                        donors_grid[ctx_pb][cb].push(Donor { gaps }, weight);
                     }
                 }
             } else if let Some(summary) = &record.itl_summary
                 && summary.count > 0
             {
                 for _ in 0..summary.count {
-                    cell.itl_samples.push(summary.mean_ms);
+                    itl_by_concurrency[cb].push(summary.mean_ms);
                 }
-                donors_by_concurrency[cb].push(
+                donors_grid[ctx_pb][cb].push(
                     Donor {
                         gaps: vec![summary.mean_ms],
                     },
@@ -392,30 +424,40 @@ impl TraceLatency {
                 );
             }
         }
-        for stalls in &mut stalls_by_concurrency {
-            stalls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        }
 
-        // Sort TTFT samples for inverse-CDF sampling.
-        for row in &mut grid {
+        for row in &mut stalls_grid {
             for cell in row.iter_mut() {
-                cell.ttft_samples
-                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                cell.itl_samples
-                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            }
-        }
-
-        // Pool ITL samples per concurrency bucket (union over prompt buckets).
-        let mut itl_by_concurrency = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
-        for row in &grid {
-            for (cb, cell) in row.iter().enumerate() {
-                itl_by_concurrency[cb].extend(cell.itl_samples.iter().copied());
+                cell.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             }
         }
         for samples in &mut itl_by_concurrency {
             samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         }
+
+        // Service time per bucket: keep only the lowest-concurrency observations.
+        let service_by_prompt: Vec<Option<ServiceCell>> = ttft_obs
+            .into_iter()
+            .map(|obs| {
+                let min_cb = obs.iter().map(|(cb, _, _)| *cb).min()?;
+                let mut samples: Vec<f64> = obs
+                    .iter()
+                    .filter(|(cb, _, _)| *cb == min_cb)
+                    .map(|(_, _, ttft)| *ttft)
+                    .collect();
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mut uncached: Vec<f64> = obs
+                    .iter()
+                    .filter(|(cb, _, _)| *cb == min_cb)
+                    .map(|(_, u, _)| *u)
+                    .collect();
+                uncached.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let median_uncached = uncached[uncached.len() / 2];
+                Some(ServiceCell {
+                    samples,
+                    median_uncached,
+                })
+            })
+            .collect();
 
         // A trace where every record is a single-token output carries no decode pacing
         // information; refuse it up front rather than replaying instant inter-token times.
@@ -427,10 +469,10 @@ impl TraceLatency {
         }
 
         Ok(TraceLatency {
-            grid,
+            service_by_prompt,
             itl_by_concurrency,
-            donors_by_concurrency,
-            stalls_by_concurrency,
+            donors_grid,
+            stalls_grid,
             kv_transfer_fallback,
             meta,
         })
@@ -451,57 +493,40 @@ pub(crate) fn sample_inverse_cdf(rng: &mut StdRng, samples: &[f64]) -> f64 {
     samples[lo] * (1.0 - frac) + samples[hi] * frac
 }
 
-/// Find the nearest non-empty cell by Manhattan distance on bucket indices, preferring
-/// the same prompt bucket (tie-break). Returns None only if the entire grid is empty
-/// (which from_records prevents).
-fn nearest_ttft(grid: &[Vec<Cell>], pb: usize, cb: usize) -> Option<&[f64]> {
-    if !grid[pb][cb].ttft_samples.is_empty() {
-        return Some(&grid[pb][cb].ttft_samples);
+/// Find the nearest cell with data by Manhattan distance on (prompt bucket,
+/// concurrency bucket) indices, preferring the same prompt bucket on ties.
+/// Returns None only when the whole grid is empty.
+fn nearest_grid_cell<T>(
+    grid: &[Vec<T>],
+    pb: usize,
+    cb: usize,
+    has_data: impl Fn(&T) -> bool,
+) -> Option<&T> {
+    if let Some(cell) = grid.get(pb).and_then(|row| row.get(cb))
+        && has_data(cell)
+    {
+        return Some(cell);
     }
-    let mut best: Option<(usize, usize, usize)> = None; // (distance, prompt_dist, indices)
+    let mut best: Option<(usize, usize, &T)> = None; // (distance, prompt_dist, cell)
     for (pi, row) in grid.iter().enumerate() {
         for (ci, cell) in row.iter().enumerate() {
-            if cell.ttft_samples.is_empty() {
+            if !has_data(cell) {
                 continue;
             }
             let pd = pi.abs_diff(pb);
             let cd = ci.abs_diff(cb);
             let dist = pd + cd;
             match best {
-                None => best = Some((dist, pd, pi * NUM_CONCURRENCY_BUCKETS + ci)),
+                None => best = Some((dist, pd, cell)),
                 Some((bd, bpd, _)) => {
                     if dist < bd || (dist == bd && pd < bpd) {
-                        best = Some((dist, pd, pi * NUM_CONCURRENCY_BUCKETS + ci));
+                        best = Some((dist, pd, cell));
                     }
                 }
             }
         }
     }
-    best.map(|(_, _, idx)| {
-        let pi = idx / NUM_CONCURRENCY_BUCKETS;
-        let ci = idx % NUM_CONCURRENCY_BUCKETS;
-        grid[pi][ci].ttft_samples.as_slice()
-    })
-}
-
-/// Find the nearest concurrency bucket with at least one donor.
-fn nearest_donor_bucket(donors_by_concurrency: &[DonorBucket], cb: usize) -> Option<usize> {
-    if !donors_by_concurrency[cb].donors.is_empty() {
-        return Some(cb);
-    }
-    let mut best: Option<(usize, usize)> = None;
-    for (ci, bucket) in donors_by_concurrency.iter().enumerate() {
-        if bucket.donors.is_empty() {
-            continue;
-        }
-        let dist = ci.abs_diff(cb);
-        match best {
-            None => best = Some((dist, ci)),
-            Some((bd, _)) if dist < bd => best = Some((dist, ci)),
-            _ => {}
-        }
-    }
-    best.map(|(_, ci)| ci)
+    best.map(|(_, _, cell)| cell)
 }
 
 /// Find nearest non-empty ITL concurrency bucket.
@@ -525,6 +550,16 @@ fn nearest_itl(itl_by_concurrency: &[Vec<f64>], cb: usize) -> Option<&[f64]> {
 }
 
 impl LatencyModel for TraceLatency {
+    /// Prefill SERVICE time only: queueing is the simulated scheduler's job.
+    /// Samples come from the nearest prompt bucket's lowest-concurrency
+    /// observations, scaled by the token ratio when borrowed across buckets.
+    /// That ratio is first-order: prefill FLOPs carry a quadratic attention
+    /// term on top of the linear MLP/projection terms (which dominate below
+    /// roughly 6x the model dim, ~24k tokens for an 8B), so a length-sweep
+    /// capture that fills the buckets and keeps borrows to one hop matters
+    /// more than the interpolant. Fitting a + b*n + c*n^2 across bucket
+    /// medians is the upgrade if sparse fits become common. The clamp keeps a
+    /// sparse fit from exploding a sample.
     fn first_token_delay(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
         if ctx.do_remote_prefill {
             return self.kv_transfer_fallback.first_token_delay(rng, ctx);
@@ -532,15 +567,30 @@ impl LatencyModel for TraceLatency {
 
         let uncached = ctx.num_prompt_tokens.saturating_sub(ctx.num_cached_tokens);
         let pb = prompt_bucket(uncached);
-        let cb = concurrency_bucket(ctx.num_running);
 
-        // from_records rejects traces with no records, so some cell is non-empty and the
-        // nearest-cell search always resolves; the zero fallback is unreachable belt-and-braces.
-        let Some(samples) = nearest_ttft(&self.grid, pb, cb) else {
+        let mut best: Option<(usize, &ServiceCell)> = None;
+        for (pi, cell) in self.service_by_prompt.iter().enumerate() {
+            let Some(cell) = cell else { continue };
+            let dist = pi.abs_diff(pb);
+            match best {
+                None => best = Some((dist, cell)),
+                Some((bd, _)) if dist < bd => best = Some((dist, cell)),
+                _ => {}
+            }
+        }
+        // from_records rejects empty traces, so some bucket has service data.
+        let Some((dist, cell)) = best else {
             return Duration::ZERO;
         };
-        let ms = sample_inverse_cdf(rng, samples);
-        Duration::from_secs_f64(ms / 1000.0)
+        // Within the request's own bucket, draw verbatim (reproduces the
+        // capture exactly); only borrowed buckets get the token-ratio scaling.
+        let ms = sample_inverse_cdf(rng, &cell.samples);
+        let scale = if dist > 0 && cell.median_uncached > 0.0 {
+            ((uncached.max(1) as f64) / cell.median_uncached).clamp(0.25, 8.0)
+        } else {
+            1.0
+        };
+        Duration::from_secs_f64(ms * scale / 1000.0)
     }
 
     fn inter_token_delay(&self, rng: &mut StdRng, num_running: u64) -> Duration {
@@ -553,12 +603,12 @@ impl LatencyModel for TraceLatency {
         Duration::from_secs_f64(ms / 1000.0)
     }
 
-    /// Hierarchical sampling: pin the request to one source request ("donor") per
+    /// Hierarchical sampling conditioned on (context bucket, concurrency
+    /// bucket): pin the request to one source request ("donor") per
     /// concurrency bucket, picked token-count-weighted on first use, then draw
-    /// gaps from that donor's own distribution. Marginal per-token quantiles match
-    /// the pooled path (same token weighting); within-request correlation matches
-    /// the source (a slow request stays slow), so per-request decode totals
-    /// reproduce instead of concentrating around the grand mean.
+    /// gaps from that donor's own distribution. Within-request correlation
+    /// matches the source (a slow request stays slow), so per-request decode
+    /// totals reproduce instead of concentrating around the grand mean.
     fn paced_inter_token_delay(
         &self,
         rng: &mut StdRng,
@@ -567,23 +617,32 @@ impl LatencyModel for TraceLatency {
     ) -> Duration {
         let cb = concurrency_bucket(num_running);
 
-        // A prefill admission noted by the engine spikes exactly one gap: draw it
-        // from the recorded prefill-interfered distribution when the trace has one.
-        // Without itl_ctx data the flag falls through to the clean path, whose
-        // donor gaps still contain the stalls (they were never separated out).
-        if pacing.pending_stall.take().is_some()
-            && let Some(stalls) = nearest_itl(&self.stalls_by_concurrency, cb)
-        {
-            let ms = sample_inverse_cdf(rng, stalls);
-            return Duration::from_secs_f64(ms / 1000.0);
+        // A prefill admission noted by the engine spikes exactly one gap: draw
+        // it from the recorded stall distribution nearest the admitted chunk's
+        // size bucket. Without itl_ctx data the flag falls through to the clean
+        // path, whose donor gaps still contain the stalls.
+        if let Some(prefill_tokens) = pacing.pending_stall.take() {
+            let ppb = prompt_bucket(prefill_tokens as usize);
+            if let Some(stalls) =
+                nearest_grid_cell(&self.stalls_grid, ppb, cb, |cell: &Vec<f64>| {
+                    !cell.is_empty()
+                })
+            {
+                let ms = sample_inverse_cdf(rng, stalls);
+                return Duration::from_secs_f64(ms / 1000.0);
+            }
         }
 
-        // The resolved bucket is deterministic for a given cb, so the cached donor
-        // index below always refers to the same bucket's pool.
-        let Some(bucket_idx) = nearest_donor_bucket(&self.donors_by_concurrency, cb) else {
+        // The resolved cell is deterministic for a given (context, cb), so the
+        // cached donor index below always refers to the same pool.
+        let Some(bucket) = nearest_grid_cell(
+            &self.donors_grid,
+            pacing.context_bucket,
+            cb,
+            |cell: &DonorBucket| !cell.donors.is_empty(),
+        ) else {
             return self.inter_token_delay(rng, num_running);
         };
-        let bucket = &self.donors_by_concurrency[bucket_idx];
         let donor_idx = match pacing.donors[cb] {
             Some(idx) => idx as usize,
             None => {
@@ -876,15 +935,20 @@ mod tests {
 
     #[test]
     fn trace_fallback_to_nearest_bucket() {
-        // Only populate a single cell in the grid: prompt bucket 0 (0-64), concurrency bucket 0 (1).
+        // Only populate a single cell: prompt 30 tokens, concurrency 1.
         let records = vec![make_record(30, 2, 77.0, vec![11.0], 1)];
         let trace =
             TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
 
-        // Query a very different bucket (large prompt, high concurrency). Should fall back
-        // to the only populated cell.
+        // A much larger prompt borrows the only populated bucket's service
+        // samples, scaled by the token ratio and clamped at 8x (10000/30 would
+        // otherwise be 333x).
         let d = trace.first_token_delay(&mut rng, &ctx(10000, 0, false, 50));
+        assert_eq!(d, std::time::Duration::from_secs_f64(0.077 * 8.0));
+
+        // A prompt in the same bucket reproduces the sample verbatim.
+        let d = trace.first_token_delay(&mut rng, &ctx(40, 0, false, 50));
         assert_eq!(d, std::time::Duration::from_secs_f64(0.077));
 
         let itl = trace.inter_token_delay(&mut rng, 50);

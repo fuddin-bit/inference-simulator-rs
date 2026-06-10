@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use rand::rngs::StdRng;
@@ -327,6 +327,7 @@ impl ActiveRequest {
         }
 
         let mut rng = StdRng::seed_from_u64(request_seed(opt.seed, engine_index, &request_id));
+        let mut pacing = DecodePacing::for_prompt(prompt_len);
         // Prompt tokens served from the local prefix cache are not recomputed, so they
         // shorten the prefill (TTFT). The block pool measured the hit at admission.
         let first_delay = latency.first_token_delay(
@@ -338,10 +339,20 @@ impl ActiveRequest {
                 num_running,
             },
         );
+        // Step alignment: when other requests are mid-step, a new prefill waits
+        // for the in-flight step before its chunk runs, so the first token lands
+        // roughly one inter-token gap later. The paced draw conditions that gap
+        // on this batch's context/concurrency and pins the request's decode
+        // donor in the process. An idle engine starts the prefill immediately.
+        let step_wait = if num_running > 1 {
+            latency.paced_inter_token_delay(&mut rng, num_running, &mut pacing)
+        } else {
+            Duration::ZERO
+        };
 
         Ok(ActiveRequest {
             rng,
-            pacing: DecodePacing::default(),
+            pacing,
             request_id,
             client_index,
             prompt_len,
@@ -353,7 +364,7 @@ impl ActiveRequest {
             num_local_cached_tokens,
             block_ids,
             lora_name,
-            next_at: Instant::now() + first_delay,
+            next_at: Instant::now() + first_delay + step_wait,
         })
     }
 
