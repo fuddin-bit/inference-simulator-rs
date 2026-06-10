@@ -117,6 +117,11 @@ enum Command {
         /// process the model was not fitted on.
         #[arg(long, requires = "replay_arrivals")]
         latency_trace: Option<PathBuf>,
+        /// With --replay-arrivals: also write the client-side measurements as
+        /// a trace JSONL, for plotting against the source (e.g.
+        /// scripts/plot_calibration.py --compare).
+        #[arg(long, requires = "replay_arrivals")]
+        dump_trace: Option<PathBuf>,
         /// Emit JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -218,6 +223,7 @@ fn run() -> Result<ExitCode> {
             tolerance,
             replay_arrivals,
             latency_trace,
+            dump_trace,
             json,
         } => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -242,6 +248,25 @@ fn run() -> Result<ExitCode> {
                     outcome.wall_time_s,
                     outcome.max_send_lag_ms,
                 );
+                if let Some(dump_path) = dump_trace {
+                    let meta = inference_simulator_rs::trace::TraceMeta {
+                        source: Some("replay-arrivals".to_string()),
+                        ..Default::default()
+                    };
+                    let file = fs::File::create(&dump_path)
+                        .with_context(|| format!("creating {}", dump_path.display()))?;
+                    let mut writer = BufWriter::new(file);
+                    inference_simulator_rs::trace::write_trace(
+                        &mut writer,
+                        &meta,
+                        &outcome.measured,
+                    )?;
+                    eprintln!(
+                        "wrote {} measured records to {}",
+                        outcome.measured.len(),
+                        dump_path.display()
+                    );
+                }
                 outcome.report
             } else {
                 runtime.block_on(calibrate_e2e_impl(
@@ -394,7 +419,7 @@ async fn calibrate_e2e_impl(
 
                 let request = EngineCoreRequest {
                     request_id: request_id.clone(),
-                    prompt_token_ids: Some(vec![42u32; prompt_len]),
+                    prompt_token_ids: Some(calibrate::synthetic_prompt(*i, prompt_len)),
                     sampling_params: Some(EngineCoreSamplingParams {
                         max_tokens,
                         ..EngineCoreSamplingParams::for_test()

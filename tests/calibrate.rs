@@ -138,7 +138,7 @@ async fn calibrate_e2e_smoke() {
 
             let request = EngineCoreRequest {
                 request_id: format!("smoke-{i}"),
-                prompt_token_ids: Some(vec![42u32; rec.prompt_tokens]),
+                prompt_token_ids: Some(calibrate::synthetic_prompt(i, rec.prompt_tokens)),
                 sampling_params: Some(EngineCoreSamplingParams {
                     max_tokens,
                     ..EngineCoreSamplingParams::for_test()

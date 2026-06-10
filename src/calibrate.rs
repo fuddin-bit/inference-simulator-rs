@@ -990,6 +990,34 @@ pub fn calibrate_from_file(
     calibrate(&records, num_samples, seed, tolerance)
 }
 
+/// Deterministic per-request prompt tokens for the wire-level harnesses.
+///
+/// Each request gets a unique token sequence so the sim's prefix cache treats
+/// it as a cold prompt, matching the captured workloads (their traces record
+/// cached_tokens=0). Identical fill tokens would silently turn every replayed
+/// request into a prefix-cache hit, collapsing TTFT into the smallest
+/// uncached-prompt bucket. Workloads with real prefix reuse (multiturn/agentic)
+/// need the actual token streams replayed instead.
+pub fn synthetic_prompt(request_index: usize, len: usize) -> Vec<u32> {
+    // SplitMix64-style mix (Steele et al., "Fast Splittable Pseudorandom Number
+    // Generators"): GOLDEN_GAMMA is 2^64/phi, the stream increment; MIX is the
+    // first finalizer multiplier. One multiply-add plus a xor-shift is enough
+    // here: we only need (request_index, position) -> token to not produce
+    // identical 16-token blocks across requests, not statistical quality.
+    const GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+    const MIX: u64 = 0xBF58_476D_1CE4_E5B9;
+    (0..len as u64)
+        .map(|j| {
+            let mut x = (request_index as u64)
+                .wrapping_mul(GOLDEN_GAMMA)
+                .wrapping_add(j.wrapping_mul(MIX));
+            x ^= x >> 33;
+            // Stay well under the sim's default vocab size (32000).
+            (x % 31_000) as u32
+        })
+        .collect()
+}
+
 /// Config for the open-loop arrival replay harness ([`replay_arrivals`]).
 pub struct ReplayArrivalsConfig<'a> {
     /// Trace supplying the arrival schedule, request shapes, and ground-truth
@@ -1013,6 +1041,9 @@ pub struct ReplayArrivalsConfig<'a> {
 #[derive(Debug)]
 pub struct ArrivalReplayOutcome {
     pub report: CalibrationReport,
+    /// Client-side measurements of completed requests in trace schema, ordered
+    /// by arrival, for external plotting against the source trace.
+    pub measured: Vec<TraceRecord>,
     /// Requests in the replayed schedule.
     pub requests_replayed: usize,
     /// Requests that produced a first token (no error, no timeout).
@@ -1172,7 +1203,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
 
             let request = EngineCoreRequest {
                 request_id: format!("replay-{i}"),
-                prompt_token_ids: Some(vec![42u32; prompt_len]),
+                prompt_token_ids: Some(synthetic_prompt(i, prompt_len)),
                 sampling_params: Some(EngineCoreSamplingParams {
                     max_tokens,
                     ..EngineCoreSamplingParams::for_test()
@@ -1241,6 +1272,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     let mut measured_ttfts: Vec<Vec<f64>> = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
     let mut measured_itls: Vec<Vec<f64>> = vec![Vec::new(); NUM_CONCURRENCY_BUCKETS];
     let mut replay_totals: Vec<f64> = Vec::new();
+    let mut measured_records: Vec<TraceRecord> = Vec::new();
     let mut requests_completed = 0usize;
     let mut max_send_lag_ms = 0.0_f64;
 
@@ -1257,6 +1289,17 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         if !m.gaps_ms.is_empty() {
             replay_totals.push(m.gaps_ms.iter().sum());
         }
+        measured_records.push(TraceRecord {
+            prompt_tokens: rec.prompt_tokens,
+            cached_tokens: 0,
+            output_tokens: m.gaps_ms.len() + 1,
+            ttft_ms: ttft,
+            itl_ms: (!m.gaps_ms.is_empty()).then(|| m.gaps_ms.clone()),
+            itl_summary: None,
+            concurrency: rec.concurrency,
+            arrival_ms: rec.arrival_ms,
+            itl_ctx: None,
+        });
     }
 
     let (measured_buckets, pooled_ttft, pooled_itl) =
@@ -1352,6 +1395,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
             request_total,
             verdict,
         },
+        measured: measured_records,
         requests_replayed: subset.len(),
         requests_completed,
         max_send_lag_ms,
