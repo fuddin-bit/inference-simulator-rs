@@ -264,3 +264,61 @@ inference-sim --handshake-address tcp://127.0.0.1:5571 \
   --latency-trace h200-qwen3-tap-trace.jsonl \
   --max-num-seqs 1024 --max-num-batched-tokens 8192
 ```
+
+### Workload scenarios: open-loop arrival replay
+
+The calibrations above sample the latency model closed-loop, which proves the
+*distributions* are right but never stresses the reactive path: TTFT queueing,
+prefill stalls, and concurrency mixing only emerge when an arrival process
+drives the scheduler. `calibrate-e2e --replay-arrivals` validates that path:
+it replays a captured arrival schedule in real time (each request sent at its
+recorded offset, open loop, regardless of how earlier requests are going) and
+compares client-side TTFT/ITL/request-total quantiles against the capture.
+`--latency-trace` fits the sim's model from a *different* trace, so the gate
+runs on an arrival process the model was never fitted on.
+
+Setup: the same frontend → tap → engine stack as the capture rig, run locally
+with `inference-sim` as the engine, its latency model fit from the original
+H200 capture (fixed-concurrency closed loop). `deploy/trace-capture/loadgen.py
+--pattern poisson|burst` drives arrival processes that capture never
+contained, the tap records ground truth, and the replay must reproduce it:
+
+| scenario           | requests | concurrency seen | TTFT max err | ITL max err | req-total err | gate (10%) |
+|--------------------|----------|------------------|--------------|-------------|---------------|------------|
+| poisson, 4 req/s   | 483      | 1-22, median 9   | 9.3%         | 1.4%        | 3.8%          | PASS       |
+| burst, 24 per 10s  | 288      | 0 -> 24 spikes   | 2.8%         | 3.8%        | 8.0%          | PASS       |
+
+The burst scenario is the harsher test: each burst floods an idle engine, so
+TTFT is dominated by queueing the latency model never saw as such (source p99
+1.46s vs the fitting trace's ~250ms). The sim's scheduler recreates the queue
+and the pooled distributions land on top of each other:
+
+![Burst arrival replay](docs/images/replay-arrivals-burst.png)
+
+![Poisson arrival replay](docs/images/replay-arrivals-poisson.png)
+
+Per-concurrency-bucket rows shuffle under bursts (admission order inside a
+burst is not deterministic, so per-request concurrency labels move), which is
+why the gate compares pooled quantiles plus per-request decode totals.
+
+Replayed prompts are unique-token synthetics: the captured workloads carry
+`cached_tokens: 0`, and identical fill tokens would silently turn every
+replayed request into a prefix-cache hit (TTFT collapses into the smallest
+uncached-prompt bucket; this was a real bug). Workloads with genuine prefix
+reuse (multiturn/agentic) need the prefix structure replayed too, which is the
+next scenario.
+
+To reproduce against any trace with `arrival_ms`:
+
+```bash
+# capture: any OpenAI-compatible target
+uv run --with httpx deploy/trace-capture/loadgen.py --url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-8B --pattern poisson --rate 4 --duration 120 \
+  --prompt-tokens 512 --output-tokens 128 --out run.json --trace-out client.jsonl
+
+# replay the schedule, fitting the model from a different capture
+just replay tap-poisson.jsonl h200-qwen3-tap-trace-v2.jsonl
+
+# real-vs-replay survival curves (replay measurements via --dump-trace)
+just compare "real=tap-poisson.jsonl" "replay=replay-measured.jsonl"
+```

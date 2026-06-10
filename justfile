@@ -84,3 +84,8 @@ compare +labeled_traces:
     uv run scripts/plot_calibration.py \
         {{ replace_regex(labeled_traces, '(\S+)', '--compare $1') }} \
         --out-dir /tmp/sim-compare
+
+# Open-loop arrival replay against a captured schedule (runs in real time).
+replay trace latency_trace tolerance="0.10":
+    cargo run --release --bin inference-sim-trace -- calibrate-e2e {{trace}} \
+        --replay-arrivals --latency-trace {{latency_trace}} --tolerance {{tolerance}}
