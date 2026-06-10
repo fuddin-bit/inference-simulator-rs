@@ -122,6 +122,15 @@ enum Command {
         /// scripts/plot_calibration.py --compare).
         #[arg(long, requires = "replay_arrivals")]
         dump_trace: Option<PathBuf>,
+        /// With --replay-arrivals: extra flag tokens for the in-process sim,
+        /// repeated per token (e.g. --sim-arg=--kv-cache-size --sim-arg=8192).
+        /// Must mirror the capture engine's scheduler/cache config.
+        #[arg(
+            long = "sim-arg",
+            requires = "replay_arrivals",
+            allow_hyphen_values = true
+        )]
+        sim_args: Vec<String>,
         /// Emit JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -224,6 +233,7 @@ fn run() -> Result<ExitCode> {
             replay_arrivals,
             latency_trace,
             dump_trace,
+            sim_args,
             json,
         } => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -239,6 +249,7 @@ fn run() -> Result<ExitCode> {
                     tolerance,
                     use_knob_fit: knob_fit,
                     ipc_tag: seed.to_string(),
+                    extra_sim_args: sim_args,
                 };
                 let outcome = runtime.block_on(calibrate::replay_arrivals(&cfg))?;
                 eprintln!(

@@ -53,6 +53,9 @@ use crate::trace::{ItlContext, TraceMeta, TraceRecord, append_record};
 struct RequestState {
     arrival: Instant,
     prompt_tokens: usize,
+    /// Chained per-block prefix fingerprints of the prompt (see
+    /// `trace::prompt_block_hashes`).
+    block_hashes: Option<Vec<u64>>,
     /// `do_remote_prefill` request (P/D decode side): its first output reflects a
     /// KV pull, not local prefill compute, so it never counts as interference.
     remote_prefill: bool,
@@ -86,6 +89,9 @@ pub struct TapConfig {
     pub output_address: String,
     /// Model name for the trace metadata.
     pub model: String,
+    /// Token-block size for prompt prefix fingerprints (should match the
+    /// engine's prefix-cache block size).
+    pub block_size: usize,
 }
 
 /// Sockets and handshake payloads captured while connecting the real engine.
@@ -310,7 +316,7 @@ pub async fn run_tap<W: Write>(
                     .context("forwarding request to engine")?;
 
                 // Decode a copy for observation.
-                observe_request(&frames, &mut requests, arrival);
+                observe_request(&frames, &mut requests, arrival, config.block_size);
             }
 
             // Upstream -> Downstream: frames from the engine to the frontend.
@@ -342,6 +348,7 @@ fn observe_request<F: AsRef<[u8]>>(
     frames: &[F],
     requests: &mut HashMap<String, RequestState>,
     arrival: Instant,
+    block_size: usize,
 ) {
     if frames.len() != 2 {
         warn!(
@@ -361,6 +368,10 @@ fn observe_request<F: AsRef<[u8]>>(
             match decode_msgpack::<EngineCoreRequest>(frames[1].as_ref()) {
                 Ok(req) => {
                     let prompt_tokens = req.prompt_token_ids.as_ref().map(Vec::len).unwrap_or(0);
+                    let block_hashes = req
+                        .prompt_token_ids
+                        .as_deref()
+                        .and_then(|tokens| crate::trace::prompt_block_hashes(tokens, block_size));
                     let concurrency = (requests.len() as u64) + 1;
                     // P/D decode side: this request's prefill ran on another node,
                     // so its first output here is a KV-pull completion, not local
@@ -380,6 +391,7 @@ fn observe_request<F: AsRef<[u8]>>(
                         RequestState {
                             arrival,
                             prompt_tokens,
+                            block_hashes,
                             remote_prefill,
                             last_output: None,
                             output_tokens: 0,
@@ -531,6 +543,7 @@ fn observe_output<W: Write, F: AsRef<[u8]>>(
                         num_running: state.itl_running,
                         prefill_tokens: state.itl_prefill,
                     }),
+                    block_hashes: state.block_hashes,
                 };
                 debug!(
                     request_id = %request_id_owned,
@@ -556,6 +569,7 @@ pub fn write_meta<W: Write>(
     model: &str,
     gpu: Option<&str>,
     tp: Option<u32>,
+    block_size: usize,
 ) -> Result<()> {
     let meta = TraceMeta {
         source: Some("tap".to_string()),
@@ -566,6 +580,7 @@ pub fn write_meta<W: Write>(
         },
         gpu: gpu.map(str::to_string),
         tp,
+        block_size: Some(block_size),
         ..TraceMeta::default()
     };
     let wrapper = serde_json::json!({"meta": meta});

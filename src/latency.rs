@@ -790,6 +790,7 @@ mod tests {
             concurrency: conc,
             arrival_ms: None,
             itl_ctx: None,
+            block_hashes: None,
         }
     }
 
@@ -906,6 +907,7 @@ mod tests {
             concurrency: 1,
             arrival_ms: None,
             itl_ctx: None,
+            block_hashes: None,
         }];
         let trace =
             TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
@@ -937,6 +939,7 @@ mod tests {
                 num_running: vec![4; 9],
                 prefill_tokens: prefill,
             }),
+            block_hashes: None,
         }];
         let trace =
             TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();

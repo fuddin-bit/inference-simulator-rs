@@ -13,6 +13,11 @@ prompts, measuring client-side TTFT and per-token ITL. Four arrival patterns:
              each level held for duration/len(levels)
   burst      open loop: --burst-size simultaneous requests every
              --burst-interval seconds
+  multiturn  agentic sessions arriving open-loop at --rate sessions/s; each
+             runs --turns closed-loop turns where the context grows by the
+             turn's prompt plus the model's response, on top of one of
+             --prefix-count shared --prefix-tokens prefixes (prefix-cache
+             exercise; defaults follow the llm-d agentic scenario shape)
 
 The server-side truth comes from the tap; this exists so the same run yields
 both views without depending on guidellm's scheduler. Every pattern records
@@ -58,11 +63,11 @@ def make_prompt(rng: random.Random, n_tokens: int) -> str:
 async def one_request(
     client: httpx.AsyncClient,
     args: argparse.Namespace,
-    rng: random.Random,
+    prompt: str,
     run_start: float,
     inflight: Gauge,
+    collect_text: bool = False,
 ) -> dict | None:
-    prompt = make_prompt(rng, args.prompt_tokens)
     body = {
         "model": args.model,
         "prompt": prompt,
@@ -74,6 +79,7 @@ async def one_request(
     concurrency = inflight.value
     start = time.perf_counter()
     stamps: list[float] = []
+    pieces: list[str] = []
     try:
         async with client.stream("POST", f"{args.url}/v1/completions", json=body) as r:
             if r.status_code != 200:
@@ -82,6 +88,11 @@ async def one_request(
                 if not line.startswith("data:") or line.strip() == "data: [DONE]":
                     continue
                 stamps.append(time.perf_counter())
+                if collect_text:
+                    try:
+                        pieces.append(json.loads(line[5:])["choices"][0]["text"])
+                    except (json.JSONDecodeError, LookupError):
+                        pass
     except httpx.HTTPError as e:
         return {"error": str(e)}
     finally:
@@ -91,8 +102,9 @@ async def one_request(
     first, last = stamps[0], stamps[-1]
     chunks = len(stamps)
     itl_ms = [(b - a) * 1000.0 for a, b in zip(stamps, stamps[1:])]
-    return {
-        "prompt_tokens": args.prompt_tokens,
+    res = {
+        # Client-side word-count approximation; the tap records the wire truth.
+        "prompt_tokens": len(prompt.split()),
         "output_tokens": chunks,
         "ttft_ms": (first - start) * 1000.0,
         "itl_mean_ms": ((last - first) / (chunks - 1)) * 1000.0 if chunks > 1 else None,
@@ -100,6 +112,9 @@ async def one_request(
         "concurrency": concurrency,
         "arrival_ms": (start - run_start) * 1000.0,
     }
+    if collect_text:
+        res["text"] = "".join(pieces)
+    return res
 
 
 async def fire(
@@ -110,7 +125,8 @@ async def fire(
     inflight: Gauge,
     results: list,
 ) -> None:
-    res = await one_request(client, args, rng, run_start, inflight)
+    prompt = make_prompt(rng, args.prompt_tokens)
+    res = await one_request(client, args, prompt, run_start, inflight)
     if res is not None:
         results.append(res)
 
@@ -203,6 +219,70 @@ async def run_burst(
         await asyncio.gather(*tasks)
 
 
+async def run_session(
+    client: httpx.AsyncClient,
+    args: argparse.Namespace,
+    prefix: str,
+    session_idx: int,
+    run_start: float,
+    inflight: Gauge,
+    results: list,
+) -> None:
+    """One agentic session: turns extend the context with each turn's prompt
+    and the model's own response, all on top of a shared prefix. Closed loop
+    within the session (turn N+1 starts when turn N finishes)."""
+    rng = random.Random(args.seed + 7000 + session_idx)
+    context = prefix
+    for turn in range(args.turns):
+        context += " " + make_prompt(rng, args.prompt_tokens)
+        res = await one_request(client, args, context, run_start, inflight, collect_text=True)
+        if res is None:
+            return
+        text = res.pop("text", "")
+        res["session"] = session_idx
+        res["turn"] = turn
+        results.append(res)
+        if "error" in res:
+            return
+        context += text
+        if args.think_time > 0:
+            await asyncio.sleep(args.think_time)
+
+
+async def run_multiturn(
+    client: httpx.AsyncClient,
+    args: argparse.Namespace,
+    results: list,
+    run_start: float,
+    inflight: Gauge,
+) -> None:
+    """Sessions arrive open-loop (poisson at --rate); each session draws one of
+    --prefix-count shared prefixes, so concurrent sessions exercise the
+    server's prefix cache the way agentic fleets do."""
+    arrivals = random.Random(args.seed)
+    prefix_count = args.prefix_count or max(1, round(2 * args.rate))
+    prefix_rng = random.Random(args.seed + 1)
+    prefixes = [make_prompt(prefix_rng, args.prefix_tokens) for _ in range(prefix_count)]
+    deadline = run_start + args.duration
+    tasks: list[asyncio.Task] = []
+    session_idx = 0
+    next_at = run_start
+    while next_at < deadline:
+        await asyncio.sleep(max(0.0, next_at - time.perf_counter()))
+        tasks.append(
+            asyncio.create_task(
+                run_session(
+                    client, args, prefixes[session_idx % prefix_count],
+                    session_idx, run_start, inflight, results,
+                )
+            )
+        )
+        session_idx += 1
+        next_at += arrivals.expovariate(args.rate)
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
 def parse_stairs(args: argparse.Namespace) -> list[int]:
     if args.stairs:
         levels = [int(s) for s in args.stairs.split(",") if s.strip()]
@@ -225,19 +305,27 @@ async def main() -> None:
     p.add_argument("--model", required=True)
     p.add_argument(
         "--pattern",
-        choices=["constant", "poisson", "staircase", "burst"],
+        choices=["constant", "poisson", "staircase", "burst", "multiturn"],
         default="constant",
     )
     p.add_argument("--concurrency", type=int, default=1,
                    help="closed-loop worker count (constant; staircase ramp ceiling)")
     p.add_argument("--rate", type=float, default=1.0,
-                   help="poisson: mean arrival rate in req/s")
+                   help="poisson/multiturn: mean arrival rate (req/s or sessions/s)")
     p.add_argument("--stairs",
                    help="staircase: comma-separated concurrency levels, e.g. 1,2,4,8")
     p.add_argument("--burst-size", type=int, default=8,
                    help="burst: simultaneous requests per burst")
     p.add_argument("--burst-interval", type=float, default=10.0,
                    help="burst: seconds between bursts")
+    p.add_argument("--turns", type=int, default=5,
+                   help="multiturn: turns per session")
+    p.add_argument("--prefix-tokens", type=int, default=10000,
+                   help="multiturn: shared prefix size per prefix group")
+    p.add_argument("--prefix-count", type=int,
+                   help="multiturn: distinct shared prefixes (default: 2*rate)")
+    p.add_argument("--think-time", type=float, default=0.0,
+                   help="multiturn: seconds between a turn finishing and the next starting")
     p.add_argument("--duration", type=float, default=60.0)
     p.add_argument("--prompt-tokens", type=int, default=512)
     p.add_argument("--output-tokens", type=int, default=128)
@@ -251,10 +339,12 @@ async def main() -> None:
     )
     args = p.parse_args()
 
-    if args.pattern == "poisson" and args.rate <= 0:
-        raise SystemExit("--rate must be > 0 for poisson")
+    if args.pattern in ("poisson", "multiturn") and args.rate <= 0:
+        raise SystemExit(f"--rate must be > 0 for {args.pattern}")
     if args.pattern == "burst" and (args.burst_size <= 0 or args.burst_interval <= 0):
         raise SystemExit("--burst-size and --burst-interval must be > 0 for burst")
+    if args.pattern == "multiturn" and args.turns <= 0:
+        raise SystemExit("--turns must be > 0 for multiturn")
 
     results: list[dict] = []
     inflight = Gauge()
@@ -273,6 +363,8 @@ async def main() -> None:
             await run_closed_loop(client, args, results, run_start, inflight, levels)
         elif args.pattern == "poisson":
             await run_poisson(client, args, results, run_start, inflight)
+        elif args.pattern == "multiturn":
+            await run_multiturn(client, args, results, run_start, inflight)
         else:
             await run_burst(client, args, results, run_start, inflight)
 
@@ -293,6 +385,11 @@ async def main() -> None:
                 elif args.pattern == "burst":
                     meta["burst_size"] = args.burst_size
                     meta["burst_interval"] = args.burst_interval
+                elif args.pattern == "multiturn":
+                    meta["rate"] = args.rate
+                    meta["turns"] = args.turns
+                    meta["prefix_tokens"] = args.prefix_tokens
+                    meta["prefix_count"] = args.prefix_count or max(1, round(2 * args.rate))
                 f.write(json.dumps({"meta": meta}) + "\n")
             for r in ok:
                 rec = {

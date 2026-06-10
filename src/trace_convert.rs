@@ -145,6 +145,7 @@ pub fn convert_guidellm(
         tp: opts.tp,
         max_num_seqs: None,
         source: Some("guidellm".to_string()),
+        block_size: None,
         extra: HashMap::new(),
     };
 
@@ -192,6 +193,7 @@ pub fn convert_guidellm(
                 concurrency,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             });
         }
     }

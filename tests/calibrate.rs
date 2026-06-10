@@ -221,6 +221,7 @@ async fn replay_arrivals_constant_trace() {
                 concurrency: 3,
                 arrival_ms: Some(i as f64 * 100.0),
                 itl_ctx: None,
+                block_hashes: None,
             })
             .collect();
         let path = std::env::temp_dir().join(format!(
@@ -237,6 +238,7 @@ async fn replay_arrivals_constant_trace() {
             tolerance: 0.25,
             use_knob_fit: false,
             ipc_tag: "test-const".to_string(),
+            extra_sim_args: Vec::new(),
         };
         let outcome = calibrate::replay_arrivals(&cfg).await.expect("replay should run");
 
@@ -291,6 +293,7 @@ async fn replay_arrivals_requires_arrival_ms() {
         tolerance: 0.25,
         use_knob_fit: false,
         ipc_tag: "test-noarrivals".to_string(),
+        extra_sim_args: Vec::new(),
     };
     let err = calibrate::replay_arrivals(&cfg)
         .await

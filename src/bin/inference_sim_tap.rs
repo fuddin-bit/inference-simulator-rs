@@ -80,6 +80,11 @@ struct TapOpt {
     /// Tensor-parallel size recorded in the trace metadata line.
     #[arg(long)]
     tp: Option<u32>,
+
+    /// Token-block size for prompt prefix fingerprints (block_hashes in the
+    /// trace). Should match the engine's prefix-cache block size.
+    #[arg(long, default_value_t = 16)]
+    block_size: usize,
 }
 
 fn init_tracing() {
@@ -135,7 +140,13 @@ async fn run_main(opt: TapOpt) -> Result<()> {
         .with_context(|| format!("creating trace file: {}", opt.trace_out))?;
     let mut writer = BufWriter::new(file);
 
-    write_meta(&mut writer, &opt.model, opt.gpu.as_deref(), opt.tp)?;
+    write_meta(
+        &mut writer,
+        &opt.model,
+        opt.gpu.as_deref(),
+        opt.tp,
+        opt.block_size,
+    )?;
 
     let config = TapConfig {
         frontend_handshake: opt.frontend_handshake,
@@ -143,6 +154,7 @@ async fn run_main(opt: TapOpt) -> Result<()> {
         input_address: opt.input_address,
         output_address: opt.output_address,
         model: opt.model,
+        block_size: opt.block_size,
     };
 
     let shutdown = shutdown_signal();

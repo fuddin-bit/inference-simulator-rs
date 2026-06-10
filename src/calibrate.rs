@@ -244,6 +244,7 @@ pub fn gen_demo(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceRecord>) 
                 concurrency: group.concurrency,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             });
         }
     }
@@ -331,6 +332,7 @@ pub fn gen_demo_fast(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceReco
                 concurrency: group.concurrency,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             });
         }
     }
@@ -990,32 +992,60 @@ pub fn calibrate_from_file(
     calibrate(&records, num_samples, seed, tolerance)
 }
 
+// SplitMix64-style mix constants (Steele et al., "Fast Splittable Pseudorandom
+// Number Generators"): GOLDEN_GAMMA is 2^64/phi, the stream increment; MIX is
+// the first finalizer multiplier. One multiply-add plus a xor-shift is enough
+// here: we only need (seed, position) -> token to not produce identical
+// token blocks across different seeds, not statistical quality.
+const GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+const MIX: u64 = 0xBF58_476D_1CE4_E5B9;
+
+/// Deterministic token at `position` of the stream keyed by `seed`.
+fn mix_token(seed: u64, position: u64) -> u32 {
+    let mut x = seed
+        .wrapping_mul(GOLDEN_GAMMA)
+        .wrapping_add(position.wrapping_mul(MIX));
+    x ^= x >> 33;
+    // Stay well under the sim's default vocab size (32000).
+    (x % 31_000) as u32
+}
+
 /// Deterministic per-request prompt tokens for the wire-level harnesses.
 ///
 /// Each request gets a unique token sequence so the sim's prefix cache treats
-/// it as a cold prompt, matching the captured workloads (their traces record
-/// cached_tokens=0). Identical fill tokens would silently turn every replayed
-/// request into a prefix-cache hit, collapsing TTFT into the smallest
-/// uncached-prompt bucket. Workloads with real prefix reuse (multiturn/agentic)
-/// need the actual token streams replayed instead.
+/// it as a cold prompt, matching captures that record cached_tokens=0.
+/// Identical fill tokens would silently turn every replayed request into a
+/// prefix-cache hit, collapsing TTFT into the smallest uncached-prompt bucket.
+/// Records that carry `block_hashes` get their prefix sharing reconstructed by
+/// [`prompt_from_block_hashes`] instead.
 pub fn synthetic_prompt(request_index: usize, len: usize) -> Vec<u32> {
-    // SplitMix64-style mix (Steele et al., "Fast Splittable Pseudorandom Number
-    // Generators"): GOLDEN_GAMMA is 2^64/phi, the stream increment; MIX is the
-    // first finalizer multiplier. One multiply-add plus a xor-shift is enough
-    // here: we only need (request_index, position) -> token to not produce
-    // identical 16-token blocks across requests, not statistical quality.
-    const GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
-    const MIX: u64 = 0xBF58_476D_1CE4_E5B9;
     (0..len as u64)
-        .map(|j| {
-            let mut x = (request_index as u64)
-                .wrapping_mul(GOLDEN_GAMMA)
-                .wrapping_add(j.wrapping_mul(MIX));
-            x ^= x >> 33;
-            // Stay well under the sim's default vocab size (32000).
-            (x % 31_000) as u32
-        })
+        .map(|j| mix_token(request_index as u64, j))
         .collect()
+}
+
+/// Reconstruct a prompt whose block-level prefix sharing matches the recorded
+/// fingerprints: each distinct hash deterministically expands to one block of
+/// tokens, so two records agree on tokens exactly where their hash chains
+/// agree, and the replay sim's prefix cache reproduces the captured engine's
+/// hits reactively. Tokens past the last full block are unique per request
+/// (a partial tail block can never be a cache hit).
+pub fn prompt_from_block_hashes(
+    hashes: &[u64],
+    prompt_tokens: usize,
+    block_size: usize,
+    request_index: usize,
+) -> Vec<u32> {
+    let mut tokens = Vec::with_capacity(prompt_tokens);
+    for &h in hashes {
+        tokens.extend((0..block_size as u64).map(|j| mix_token(h, j)));
+    }
+    // Defensive: a malformed record could carry more hashed blocks than
+    // prompt_tokens; the prompt length is the schema's source of truth.
+    tokens.truncate(prompt_tokens);
+    let tail = prompt_tokens - tokens.len();
+    tokens.extend(synthetic_prompt(request_index, tail));
+    tokens
 }
 
 /// Config for the open-loop arrival replay harness ([`replay_arrivals`]).
@@ -1034,6 +1064,10 @@ pub struct ReplayArrivalsConfig<'a> {
     pub use_knob_fit: bool,
     /// Disambiguates the IPC socket when several replays share a process.
     pub ipc_tag: String,
+    /// Extra CLI flags for the in-process sim (e.g. --kv-cache-size). The
+    /// replay sim must match the capture engine's scheduler/cache config for
+    /// the reactive comparison to be apples-to-apples.
+    pub extra_sim_args: Vec<String>,
 }
 
 /// Outcome of an open-loop arrival replay: the calibration report plus
@@ -1084,6 +1118,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
         .with_context(|| format!("opening trace: {}", cfg.trace_path.display()))?;
     let (meta, all_records) = read_trace(std::io::BufReader::new(file))
         .with_context(|| format!("parsing trace: {}", cfg.trace_path.display()))?;
+    let block_size = meta.block_size.unwrap_or(16);
 
     let mut subset: Vec<TraceRecord> = all_records
         .into_iter()
@@ -1154,6 +1189,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
             latency_path.to_string_lossy().to_string(),
         ]);
     }
+    args.extend(cfg.extra_sim_args.iter().cloned());
 
     let opt = crate::Opt::parse_from(&args);
     let token = CancellationToken::new();
@@ -1176,7 +1212,12 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     for (i, rec) in subset.iter().enumerate() {
         let offset_ms = (rec.arrival_ms.unwrap_or(first_arrival) - first_arrival).max(0.0);
         let target = base + Duration::from_secs_f64(offset_ms / 1000.0);
-        let prompt_len = rec.prompt_tokens;
+        // Reconstruct prefix sharing when the capture fingerprinted it;
+        // otherwise every prompt is unique (cold cache, matching the capture).
+        let prompt = match rec.block_hashes.as_deref() {
+            Some(hashes) => prompt_from_block_hashes(hashes, rec.prompt_tokens, block_size, i),
+            None => synthetic_prompt(i, rec.prompt_tokens),
+        };
         let max_tokens = rec.output_tokens.max(1).min(u32::MAX as usize) as u32;
         // Generous per-request timeout scaled to the source duration: open-loop
         // replay can queue far past the source under model mismatch, and a
@@ -1203,7 +1244,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
 
             let request = EngineCoreRequest {
                 request_id: format!("replay-{i}"),
-                prompt_token_ids: Some(synthetic_prompt(i, prompt_len)),
+                prompt_token_ids: Some(prompt),
                 sampling_params: Some(EngineCoreSamplingParams {
                     max_tokens,
                     ..EngineCoreSamplingParams::for_test()
@@ -1299,6 +1340,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
             concurrency: rec.concurrency,
             arrival_ms: rec.arrival_ms,
             itl_ctx: None,
+            block_hashes: None,
         });
     }
 
@@ -1455,6 +1497,51 @@ mod tests {
     }
 
     #[test]
+    fn prompt_reconstruction_mirrors_hash_chains() {
+        use crate::trace::prompt_block_hashes;
+
+        let block = 16usize;
+        // Two "captured" prompts sharing 32 tokens then diverging.
+        let shared: Vec<u32> = (0..32).collect();
+        let mut a = shared.clone();
+        a.extend(200..232);
+        let mut b = shared.clone();
+        b.extend(300..340);
+
+        let ha = prompt_block_hashes(&a, block).unwrap();
+        let hb = prompt_block_hashes(&b, block).unwrap();
+
+        let ra = prompt_from_block_hashes(&ha, a.len(), block, 0);
+        let rb = prompt_from_block_hashes(&hb, b.len(), block, 1);
+
+        assert_eq!(ra.len(), a.len());
+        assert_eq!(rb.len(), b.len());
+        // Reconstructed prompts share tokens exactly where the originals did.
+        assert_eq!(ra[..32], rb[..32], "shared prefix must reconstruct shared");
+        assert_ne!(ra[32..48], rb[32..48], "divergent blocks must differ");
+        // Re-fingerprinting the reconstruction yields a chain with the same
+        // sharing structure (equal where the original chains were equal).
+        let ra2 = prompt_block_hashes(&ra, block).unwrap();
+        let rb2 = prompt_block_hashes(&rb, block).unwrap();
+        assert_eq!(ra2[..2], rb2[..2]);
+        assert_ne!(ra2[2], rb2[2]);
+    }
+
+    #[test]
+    fn prompt_reconstruction_tail_is_unique_per_request() {
+        // 2 full blocks + 5-token tail; same hashes, different request index.
+        let hashes = vec![7u64, 8u64];
+        let x = prompt_from_block_hashes(&hashes, 37, 16, 10);
+        let y = prompt_from_block_hashes(&hashes, 37, 16, 11);
+        assert_eq!(x[..32], y[..32], "hashed blocks are shared");
+        assert_ne!(x[32..], y[32..], "tails must not collide across requests");
+
+        // Malformed record: more hashed blocks than prompt_tokens. Length wins.
+        let z = prompt_from_block_hashes(&hashes, 20, 16, 12);
+        assert_eq!(z.len(), 20);
+    }
+
+    #[test]
     fn max_relative_error_different() {
         let a = Quantiles {
             p50: 10.0,
@@ -1485,6 +1572,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             })
             .collect();
 
@@ -1532,6 +1620,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             })
             .collect();
 
@@ -1558,6 +1647,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             })
             .collect();
 
@@ -1580,6 +1670,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             })
             .collect();
 
@@ -1650,6 +1741,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             })
             .collect();
 
@@ -1688,6 +1780,7 @@ mod tests {
                 concurrency: 4,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             });
         }
 

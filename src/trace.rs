@@ -29,6 +29,10 @@ pub struct TraceMeta {
     pub max_num_seqs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Token-block size behind the records' `block_hashes` (prefix-sharing
+    /// fingerprints). Hashes are chained per block, mooncake-style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_size: Option<usize>,
     /// Freeform key-value pairs for any fields not covered above.
     #[serde(default, skip_serializing_if = "HashMap::is_empty", flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -87,10 +91,47 @@ pub struct TraceRecord {
     /// Per-gap batch context, parallel to `itl_ms` when both are present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub itl_ctx: Option<ItlContext>,
+    /// Chained hashes of the prompt's full token blocks (block size in
+    /// `TraceMeta::block_size`), recording prefix-sharing structure without the
+    /// tokens themselves: two requests share a prompt prefix exactly where
+    /// their hash chains agree. Lets a replay reconstruct prompts whose prefix
+    /// overlap (and thus prefix-cache behavior) matches the capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_hashes: Option<Vec<u64>>,
 }
 
 fn default_concurrency() -> u64 {
     1
+}
+
+/// Chained FNV-1a fingerprints of a prompt's full token blocks, for
+/// `TraceRecord::block_hashes`. Block i's hash folds block i-1's hash, so two
+/// records' chains agree exactly as far as their prompts share a prefix (the
+/// same chaining idea as vLLM's prefix-cache blocks and mooncake's trace
+/// format). The partial tail block is not hashed (it can never be a cache
+/// hit). Returns None when the prompt has no full block.
+pub fn prompt_block_hashes(tokens: &[u32], block_size: usize) -> Option<Vec<u64>> {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    if block_size == 0 || tokens.len() < block_size {
+        return None;
+    }
+    let mut hashes = Vec::with_capacity(tokens.len() / block_size);
+    let mut prev: u64 = FNV_OFFSET;
+    for block in tokens.chunks_exact(block_size) {
+        let mut h = FNV_OFFSET;
+        for byte in prev
+            .to_le_bytes()
+            .into_iter()
+            .chain(block.iter().flat_map(|t| t.to_le_bytes()))
+        {
+            h = (h ^ byte as u64).wrapping_mul(FNV_PRIME);
+        }
+        prev = h;
+        hashes.push(h);
+    }
+    Some(hashes)
 }
 
 /// Parse a trace from any `BufRead`. The first line is checked for a `"meta"` key; if
@@ -212,6 +253,7 @@ mod tests {
             tp: Some(2),
             max_num_seqs: Some(128),
             source: Some("guidellm".to_string()),
+            block_size: None,
             extra: HashMap::new(),
         }
     }
@@ -228,6 +270,7 @@ mod tests {
                 concurrency: 3,
                 arrival_ms: Some(1234.5),
                 itl_ctx: None,
+                block_hashes: None,
             },
             TraceRecord {
                 prompt_tokens: 200,
@@ -239,6 +282,7 @@ mod tests {
                 concurrency: 1,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             },
             TraceRecord {
                 prompt_tokens: 50,
@@ -253,6 +297,7 @@ mod tests {
                 concurrency: 5,
                 arrival_ms: None,
                 itl_ctx: None,
+                block_hashes: None,
             },
         ]
     }
@@ -380,6 +425,7 @@ mod tests {
             concurrency: 1,
             arrival_ms: None,
             itl_ctx: None,
+            block_hashes: None,
         };
         let mut buf = Vec::new();
         append_record(&mut buf, &record).unwrap();
@@ -387,5 +433,39 @@ mod tests {
         assert!(text.ends_with('\n'));
         let parsed: TraceRecord = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn block_hashes_agree_exactly_on_shared_prefixes() {
+        let block = 4usize;
+        let shared: Vec<u32> = (0..12).collect();
+
+        // Same prefix, diverging after block 2: chains agree for 2 blocks.
+        let mut a = shared.clone();
+        a.extend([100, 101, 102, 103]);
+        let mut b = shared.clone();
+        b[8] = 999; // diverge inside block 2
+        b.extend([100, 101, 102, 103]);
+
+        let ha = prompt_block_hashes(&a, block).unwrap();
+        let hb = prompt_block_hashes(&b, block).unwrap();
+        assert_eq!(ha.len(), 4);
+        assert_eq!(ha[..2], hb[..2], "shared prefix blocks must hash equal");
+        assert_ne!(ha[2], hb[2], "divergent block must hash differently");
+        // Chaining: identical block CONTENT after the divergence still differs,
+        // because the previous hash is folded in.
+        assert_ne!(ha[3], hb[3], "chains must stay diverged");
+
+        // Identical prompts hash identically end to end.
+        assert_eq!(prompt_block_hashes(&a, block).unwrap(), ha);
+    }
+
+    #[test]
+    fn block_hashes_ignore_partial_tail() {
+        let tokens: Vec<u32> = (0..10).collect();
+        let hashes = prompt_block_hashes(&tokens, 4).unwrap();
+        assert_eq!(hashes.len(), 2, "10 tokens = 2 full blocks of 4 + tail");
+        assert!(prompt_block_hashes(&tokens[..3], 4).is_none());
+        assert!(prompt_block_hashes(&tokens, 0).is_none());
     }
 }
