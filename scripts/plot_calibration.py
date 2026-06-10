@@ -141,17 +141,85 @@ def mean_vs_pertoken_figure(dump: dict, trace_path: Path, out: Path) -> None:
     print(f"wrote {out}")
 
 
+def load_trace_samples(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Pool TTFT and per-token ITL samples from a trace JSONL."""
+    ttfts: list[float] = []
+    itls: list[float] = []
+    with open(path) as f:
+        for line in f:
+            r = json.loads(line)
+            if "meta" in r:
+                continue
+            ttfts.append(r["ttft_ms"])
+            if r.get("itl_ms"):
+                itls.extend(r["itl_ms"])
+            elif r.get("itl_summary"):
+                itls.extend([r["itl_summary"]["mean_ms"]] * r["itl_summary"]["count"])
+    return np.array(ttfts), np.array(itls)
+
+
+def comparison_figure(traces: list[tuple[str, Path]], out: Path) -> None:
+    """Survival curves for several traces on shared axes: one labeled trace per curve."""
+    palette = [C_SRC, C_REP, C_KNB, "#2ca02c", "#9467bd"]
+    fig, (ax_itl, ax_ttft) = plt.subplots(1, 2, figsize=(13, 5))
+
+    for (label, path), color in zip(traces, palette):
+        ttfts, itls = load_trace_samples(path)
+        lw = 2.6 if color == C_SRC else 1.8
+        survival(ax_itl, itls, label, color, lw)
+        survival(ax_ttft, ttfts, label, color, lw)
+
+    ax_itl.set_xscale("log")
+    ax_itl.set_yscale("log")
+    ax_itl.set_xlabel("inter-token latency (ms)")
+    ax_itl.set_ylabel("P(ITL > x)")
+    ax_itl.set_title("ITL survival")
+    ax_itl.legend()
+    ax_itl.grid(alpha=0.3, which="both")
+
+    ax_ttft.set_yscale("log")
+    ax_ttft.set_xlabel("TTFT (ms)")
+    ax_ttft.set_ylabel("P(TTFT > x)")
+    ax_ttft.set_title("TTFT survival")
+    ax_ttft.legend()
+    ax_ttft.grid(alpha=0.3, which="both")
+
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    print(f"wrote {out}")
+
+
+def parse_labeled_trace(spec: str) -> tuple[str, Path]:
+    label, _, path = spec.partition("=")
+    if not path:
+        raise argparse.ArgumentTypeError(f"expected LABEL=PATH, got {spec!r}")
+    return label, Path(path)
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--samples", type=Path, required=True, help="calibrate --dump-samples output")
-    p.add_argument("--trace", type=Path, required=True, help="the source trace JSONL")
+    p.add_argument("--samples", type=Path, help="calibrate --dump-samples output")
+    p.add_argument("--trace", type=Path, help="the source trace JSONL")
+    p.add_argument(
+        "--compare",
+        type=parse_labeled_trace,
+        action="append",
+        metavar="LABEL=PATH",
+        help="repeatable; plot survival curves of several traces on shared axes "
+        "(first entry is drawn as the reference)",
+    )
     p.add_argument("--out-dir", type=Path, default=Path("."))
     args = p.parse_args()
 
-    dump = json.load(open(args.samples))
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    fidelity_figure(dump, args.out_dir / "replay-fidelity.png")
-    mean_vs_pertoken_figure(dump, args.trace, args.out_dir / "mean-vs-pertoken.png")
+    if args.samples and args.trace:
+        dump = json.load(open(args.samples))
+        fidelity_figure(dump, args.out_dir / "replay-fidelity.png")
+        mean_vs_pertoken_figure(dump, args.trace, args.out_dir / "mean-vs-pertoken.png")
+    if args.compare:
+        comparison_figure(args.compare, args.out_dir / "sim-comparison.png")
+    if not (args.samples and args.trace) and not args.compare:
+        p.error("nothing to do: pass --samples/--trace and/or --compare")
 
 
 if __name__ == "__main__":

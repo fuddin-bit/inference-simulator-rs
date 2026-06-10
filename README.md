@@ -235,3 +235,32 @@ To regenerate from any trace with per-token `itl_ms` arrays:
 cargo run --bin inference-sim-trace -- calibrate trace.jsonl --dump-samples samples.json
 uv run scripts/plot_calibration.py --samples samples.json --trace trace.jsonl --out-dir docs/images
 ```
+
+### Comparison with llm-d-inference-sim
+
+Same workload (`deploy/trace-capture/loadgen.py`, concurrency 1 and 16, 512/128
+tokens) against three targets: the real H200 engine (tap-recorded), this
+simulator replaying the H200 trace, and the Go
+[llm-d-inference-sim](https://github.com/llm-d/llm-d-inference-sim) (v0.9.1)
+with its latency knobs fit to the same trace (TTFT 132ms, ITL 11ms). Both
+simulators ran natively on the same host, measured client-side by the same
+load generator; the real-engine curves are the tap recording.
+
+Fitting note: the trace's actual std-devs (TTFT 80ms, ITL 8ms) exceed
+llm-d-inference-sim's config validation, which caps std-dev at 30% of the
+mean, so it runs with the largest spread it accepts (39ms / 3.3ms).
+
+![Real engine vs both simulators](docs/images/sim-comparison.png)
+
+```bash
+# llm-d-inference-sim invocation used above
+llm-d-inference-sim --port 8001 --model Qwen/Qwen3-8B --mode random \
+  --force-dummy-tokenizer --max-model-len 16384 --max-num-seqs 128 \
+  --time-to-first-token 132ms --time-to-first-token-std-dev 39ms \
+  --inter-token-latency 11ms --inter-token-latency-std-dev 3300us
+
+# this simulator: vllm-rs frontend + trace replay, vLLM-default scheduler limits
+inference-sim --handshake-address tcp://127.0.0.1:5571 \
+  --latency-trace h200-qwen3-tap-trace.jsonl \
+  --max-num-seqs 1024 --max-num-batched-tokens 8192
+```

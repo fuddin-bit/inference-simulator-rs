@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import random
 import time
 
@@ -49,8 +50,7 @@ async def one_request(
         "stream": True,
     }
     start = time.perf_counter()
-    first = last = None
-    chunks = 0
+    stamps: list[float] = []
     try:
         async with client.stream("POST", f"{args.url}/v1/completions", json=body) as r:
             if r.status_code != 200:
@@ -58,20 +58,20 @@ async def one_request(
             async for line in r.aiter_lines():
                 if not line.startswith("data:") or line.strip() == "data: [DONE]":
                     continue
-                now = time.perf_counter()
-                if first is None:
-                    first = now
-                last = now
-                chunks += 1
+                stamps.append(time.perf_counter())
     except httpx.HTTPError as e:
         return {"error": str(e)}
-    if first is None or last is None or chunks < 1:
+    if not stamps:
         return {"error": "no tokens"}
+    first, last = stamps[0], stamps[-1]
+    chunks = len(stamps)
+    itl_ms = [(b - a) * 1000.0 for a, b in zip(stamps, stamps[1:])]
     return {
         "prompt_tokens": args.prompt_tokens,
         "output_tokens": chunks,
         "ttft_ms": (first - start) * 1000.0,
         "itl_mean_ms": ((last - first) / (chunks - 1)) * 1000.0 if chunks > 1 else None,
+        "itl_ms": itl_ms,
         "concurrency": args.concurrency,
     }
 
@@ -99,6 +99,11 @@ async def main() -> None:
     p.add_argument("--prompt-tokens", type=int, default=512)
     p.add_argument("--output-tokens", type=int, default=128)
     p.add_argument("--out", required=True)
+    p.add_argument(
+        "--trace-out",
+        help="also append records in the inference-sim trace JSONL schema "
+        "(client-side measurements; writes a meta line if the file is new)",
+    )
     args = p.parse_args()
 
     results: list[dict] = []
@@ -116,6 +121,22 @@ async def main() -> None:
     errs = [r for r in results if "error" in r]
     with open(args.out, "w") as f:
         json.dump({"args": vars(args), "results": ok, "errors": errs}, f, indent=1)
+
+    if args.trace_out:
+        new_file = not os.path.exists(args.trace_out) or os.path.getsize(args.trace_out) == 0
+        with open(args.trace_out, "a") as f:
+            if new_file:
+                f.write(json.dumps({"meta": {"model": args.model, "source": "loadgen-client"}}) + "\n")
+            for r in ok:
+                rec = {
+                    "prompt_tokens": r["prompt_tokens"],
+                    "cached_tokens": 0,
+                    "output_tokens": r["output_tokens"],
+                    "ttft_ms": r["ttft_ms"],
+                    "itl_ms": r["itl_ms"],
+                    "concurrency": r["concurrency"],
+                }
+                f.write(json.dumps(rec) + "\n")
     itls = sorted(r["itl_mean_ms"] for r in ok if r["itl_mean_ms"] is not None)
     ttfts = sorted(r["ttft_ms"] for r in ok)
 
