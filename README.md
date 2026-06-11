@@ -265,6 +265,39 @@ inference-sim --handshake-address tcp://127.0.0.1:5571 \
   --max-num-seqs 1024 --max-num-batched-tokens 8192
 ```
 
+### Step-granular interference: counterfactual replay
+
+The engine paces emission with a step clock that mirrors vLLM's per-step
+schedule: decodes claim the shared token budget first, prefills chunk into
+whatever remains (in admission order), and every co-running decode's gap is
+the composed step's duration. Chunk compute is fitted from the trace as a
+depth-dependent law (attention makes deep chunks cost more per token) plus a
+max-shape premium for budget-saturated steps; small chunks hide under the
+batch's decode compute. Queueing, chunk serialization, and decode elongation
+all emerge from that one composer - there are no interference knobs.
+
+The test is counterfactual: fit on one workload (a constant-load sweep plus a
+warm multiturn capture), then replay a workload the model never saw - a
+cold-cache multiturn (~11k-token prompts, prefix caching disabled) whose
+prefill chunks continuously interfere with running decodes. The real engine
+spreads that interference as a two-shelf ITL band (~14% of gaps elongated,
+clustering at the chunk-step costs); the replay reproduces the band's shape,
+mass (13.9% vs 14.1%), and tail within a few percent:
+
+![Counterfactual cold-multiturn replay](docs/images/step-model-counterfactual.png)
+
+The factual leg (warm multiturn, 99%+ prefix-cache hits) stays calibrated
+under the same model, and a low-rate cold leg reproduces the same band at a
+quarter of the arrival rate - one mechanic across load regimes:
+
+![Factual warm-multiturn replay](docs/images/step-model-factual.png)
+
+![Low-rate cold-multiturn replay](docs/images/step-model-lowrate.png)
+
+The same fit procedure transfers across architectures: refitting from a
+Qwen3-30B-A3B (MoE) sweep with zero constant changes reproduces its
+counterfactual band as well.
+
 ### Workload scenarios: open-loop arrival replay
 
 The calibrations above sample the latency model closed-loop, which proves the
