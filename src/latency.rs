@@ -246,17 +246,21 @@ pub fn prompt_bucket(uncached_prompt_tokens: usize) -> usize {
 }
 
 /// Concurrency bucket boundaries. A concurrency value maps to the first range it fits in.
+/// 5-8 splits at 6|7 so a c8 constant-load capture cell does not donate decode gaps to
+/// 5-6-concurrency replay draws: one extra running request is a visible step-cost change
+/// at small batch sizes, and blended donors land between the two regimes' distributions.
 pub const CONCURRENCY_RANGES: &[(u64, u64)] = &[
     (1, 1),
     (2, 4),
-    (5, 8),
+    (5, 6),
+    (7, 8),
     (9, 16),
     (17, 32),
     (33, 64),
     (65, u64::MAX),
 ];
 
-pub const NUM_CONCURRENCY_BUCKETS: usize = 7;
+pub const NUM_CONCURRENCY_BUCKETS: usize = 8;
 
 pub fn concurrency_bucket(concurrency: u64) -> usize {
     for (i, &(lo, hi)) in CONCURRENCY_RANGES.iter().enumerate() {
@@ -1396,9 +1400,11 @@ mod tests {
         assert_eq!(concurrency_bucket(2), 1);
         assert_eq!(concurrency_bucket(4), 1);
         assert_eq!(concurrency_bucket(5), 2);
-        assert_eq!(concurrency_bucket(8), 2);
-        assert_eq!(concurrency_bucket(9), 3);
-        assert_eq!(concurrency_bucket(65), 6);
-        assert_eq!(concurrency_bucket(1000), 6);
+        assert_eq!(concurrency_bucket(6), 2);
+        assert_eq!(concurrency_bucket(7), 3);
+        assert_eq!(concurrency_bucket(8), 3);
+        assert_eq!(concurrency_bucket(9), 4);
+        assert_eq!(concurrency_bucket(65), 7);
+        assert_eq!(concurrency_bucket(1000), 7);
     }
 }
