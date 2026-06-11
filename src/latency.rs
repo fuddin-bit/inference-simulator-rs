@@ -324,6 +324,158 @@ struct ServiceCell {
     median_uncached: f64,
 }
 
+/// Parametric prefill service curve `T(u) = a + b*u + c*u^2` (ms, u = uncached
+/// prompt tokens), least-squares fitted to p10-TTFT floors of sliding token
+/// windows over the trace's lowest-concurrency records. The low percentile
+/// approximates pure service (a request that never queued); the quadratic term
+/// carries the attention cost that a linear token ratio misses. `floor_ms`
+/// (the smallest window floor seen) clamps the curve so extrapolation below
+/// the captured range cannot dip under the kernel-launch + sampling floor.
+#[derive(Debug, Clone, Copy)]
+struct ServiceFit {
+    a: f64,
+    b: f64,
+    c: f64,
+    floor_ms: f64,
+}
+
+impl ServiceFit {
+    fn eval_ms(&self, uncached: f64) -> f64 {
+        (self.a + self.b * uncached + self.c * uncached * uncached).max(self.floor_ms)
+    }
+}
+
+/// p10 floor and median token count of one sliding window of (uncached, ttft)
+/// observations, plus its sample count for weighting.
+struct ServiceWindow {
+    u: f64,
+    p10_ms: f64,
+    count: usize,
+}
+
+/// Slice lowest-concurrency observations into sliding token windows and take
+/// each window's p10 TTFT as a service-floor point.
+fn service_windows(obs: &[(f64, f64)]) -> Vec<ServiceWindow> {
+    const WIDTH: f64 = 600.0;
+    const STRIDE: f64 = 400.0;
+    const MIN_OBS: usize = 5;
+    let mut windows = Vec::new();
+    let Some(&(first_u, _)) = obs.first() else {
+        return windows;
+    };
+    let Some(&(last_u, _)) = obs.last() else {
+        return windows;
+    };
+    let mut lo = first_u;
+    while lo <= last_u {
+        let hi = lo + WIDTH;
+        let start = obs.partition_point(|&(u, _)| u < lo);
+        let end = obs.partition_point(|&(u, _)| u < hi);
+        let slice = &obs[start..end];
+        if slice.len() >= MIN_OBS {
+            let mut ttfts: Vec<f64> = slice.iter().map(|&(_, t)| t).collect();
+            ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p10 = ttfts[ttfts.len() / 10];
+            windows.push(ServiceWindow {
+                u: slice[slice.len() / 2].0,
+                p10_ms: p10,
+                count: slice.len(),
+            });
+        }
+        lo += STRIDE;
+    }
+    windows
+}
+
+/// Weighted least squares for `y = a + b*u + c*u^2` over window floors
+/// (weight = sqrt(count)). Falls back to the linear fit when the quadratic
+/// normal equations are degenerate (fewer than 4 windows or a singular
+/// system), and to `None` when even a line is unsupported; callers then keep
+/// the per-bucket sampling path. Negative-curvature fits that would bend the
+/// curve downward inside the observed range also fall back to linear: service
+/// time cannot shrink as prompts grow.
+fn fit_service_curve(windows: &[ServiceWindow]) -> Option<ServiceFit> {
+    let floor_ms = windows
+        .iter()
+        .map(|w| w.p10_ms)
+        .fold(f64::INFINITY, f64::min);
+    if !floor_ms.is_finite() {
+        return None;
+    }
+    let u_max = windows.iter().map(|w| w.u).fold(0.0, f64::max);
+
+    if windows.len() >= 4
+        && let Some([a, b, c]) = solve_weighted_poly::<3>(windows)
+        && c >= 0.0
+        && b + 2.0 * c * u_max >= 0.0
+    {
+        return Some(ServiceFit { a, b, c, floor_ms });
+    }
+    if windows.len() >= 2
+        && let Some([a, b]) = solve_weighted_poly::<2>(windows)
+        && b >= 0.0
+    {
+        return Some(ServiceFit {
+            a,
+            b,
+            c: 0.0,
+            floor_ms,
+        });
+    }
+    None
+}
+
+/// Solve the DEG-term weighted polynomial normal equations by Gaussian
+/// elimination with partial pivoting. Returns `None` on a singular system.
+fn solve_weighted_poly<const DEG: usize>(windows: &[ServiceWindow]) -> Option<[f64; DEG]> {
+    let mut a = [[0.0f64; DEG]; DEG];
+    let mut rhs = [0.0f64; DEG];
+    for w in windows {
+        let weight = (w.count as f64).sqrt();
+        let mut powers = [1.0f64; DEG];
+        for k in 1..DEG {
+            powers[k] = powers[k - 1] * w.u;
+        }
+        for i in 0..DEG {
+            for j in 0..DEG {
+                a[i][j] += weight * powers[i] * powers[j];
+            }
+            rhs[i] += weight * powers[i] * w.p10_ms;
+        }
+    }
+    // Gaussian elimination with partial pivoting.
+    for col in 0..DEG {
+        let pivot = (col..DEG).max_by(|&x, &y| {
+            a[x][col]
+                .abs()
+                .partial_cmp(&a[y][col].abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        if a[pivot][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, pivot);
+        rhs.swap(col, pivot);
+        let pivot_row = a[col];
+        for row in (col + 1)..DEG {
+            let factor = a[row][col] / pivot_row[col];
+            for (k, &p) in pivot_row.iter().enumerate().skip(col) {
+                a[row][k] -= factor * p;
+            }
+            rhs[row] -= factor * rhs[col];
+        }
+    }
+    let mut out = [0.0f64; DEG];
+    for col in (0..DEG).rev() {
+        let mut acc = rhs[col];
+        for k in (col + 1)..DEG {
+            acc -= a[col][k] * out[k];
+        }
+        out[col] = acc / a[col][col];
+    }
+    Some(out)
+}
+
 /// Replay latency model fit from recorded observations.
 ///
 /// The decomposition matters: `first_token_delay` is prefill SERVICE time
@@ -339,7 +491,11 @@ struct ServiceCell {
 /// must not draw gaps captured at 800 tokens. Prefill-interference stalls are
 /// conditioned on the admitted chunk's size bucket for the same reason.
 pub struct TraceLatency {
-    /// First-token service time per uncached-prompt bucket.
+    /// Parametric service curve fitted across all prompt sizes; the primary
+    /// first-token model when the trace supports it (see `ServiceFit`).
+    service_fit: Option<ServiceFit>,
+    /// First-token service time per uncached-prompt bucket. Fallback when the
+    /// trace is too sparse to fit a service curve.
     service_by_prompt: Vec<Option<ServiceCell>>,
     /// Pooled ITL samples per concurrency bucket (marginal fallback for
     /// un-paced callers).
@@ -480,7 +636,22 @@ impl TraceLatency {
             );
         }
 
+        // Service curve: p10 floors of the lowest-concurrency records, all
+        // prompt sizes pooled into one weighted quadratic fit.
+        let min_concurrency = records.iter().map(|r| r.concurrency).min().unwrap_or(0);
+        let mut floor_obs: Vec<(f64, f64)> = records
+            .iter()
+            .filter(|r| r.concurrency == min_concurrency)
+            .map(|r| {
+                let uncached = r.prompt_tokens.saturating_sub(r.cached_tokens);
+                (uncached.max(1) as f64, r.ttft_ms)
+            })
+            .collect();
+        floor_obs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let service_fit = fit_service_curve(&service_windows(&floor_obs));
+
         Ok(TraceLatency {
+            service_fit,
             service_by_prompt,
             itl_by_concurrency,
             donors_grid,
@@ -563,21 +734,22 @@ fn nearest_itl(itl_by_concurrency: &[Vec<f64>], cb: usize) -> Option<&[f64]> {
 
 impl LatencyModel for TraceLatency {
     /// Prefill SERVICE time only: queueing is the simulated scheduler's job.
-    /// Samples come from the nearest prompt bucket's lowest-concurrency
-    /// observations, scaled by the token ratio when borrowed across buckets.
-    /// That ratio is first-order: prefill FLOPs carry a quadratic attention
-    /// term on top of the linear MLP/projection terms (which dominate below
-    /// roughly 6x the model dim, ~24k tokens for an 8B), so a length-sweep
-    /// capture that fills the buckets and keeps borrows to one hop matters
-    /// more than the interpolant. Fitting a + b*n + c*n^2 across bucket
-    /// medians is the upgrade if sparse fits become common. The clamp keeps a
-    /// sparse fit from exploding a sample.
+    /// The fitted curve `T(u) = a + b*u + c*u^2` over lowest-concurrency p10
+    /// floors is the primary model (the quadratic term carries the attention
+    /// cost; the floor clamp the kernel-launch minimum). Traces too sparse to
+    /// fit fall back to per-bucket sampling from the nearest prompt bucket's
+    /// lowest-concurrency observations, scaled by the token ratio when
+    /// borrowed across buckets; the clamp keeps a sparse fit from exploding a
+    /// sample.
     fn first_token_delay(&self, rng: &mut StdRng, ctx: &FirstTokenCtx) -> Duration {
         if ctx.do_remote_prefill {
             return self.kv_transfer_fallback.first_token_delay(rng, ctx);
         }
 
         let uncached = ctx.num_prompt_tokens.saturating_sub(ctx.num_cached_tokens);
+        if let Some(fit) = &self.service_fit {
+            return Duration::from_secs_f64(fit.eval_ms(uncached.max(1) as f64) / 1000.0);
+        }
         let pb = prompt_bucket(uncached);
 
         let mut best: Option<(usize, &ServiceCell)> = None;
@@ -839,6 +1011,88 @@ mod tests {
 
     use crate::latency::TraceLatency;
     use crate::trace::{ItlSummary, TraceMeta, TraceRecord};
+
+    /// The synthetic service law used by the curve-fit tests.
+    fn quad_ms(u: f64) -> f64 {
+        20.0 + 0.02 * u + 1.0e-6 * u * u
+    }
+
+    /// Clustered lowest-concurrency records along `quad_ms`: 6 identical
+    /// observations every 700 tokens, so each sliding window holds exactly one
+    /// cluster and the window floor IS the curve value.
+    fn quad_floor_records() -> Vec<TraceRecord> {
+        let mut records = Vec::new();
+        for i in 0..12 {
+            let u = 100 + 700 * i;
+            for _ in 0..6 {
+                records.push(make_record(u, 2, quad_ms(u as f64), vec![10.0], 1));
+            }
+        }
+        records
+    }
+
+    #[test]
+    fn trace_service_fit_recovers_quadratic() {
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &quad_floor_records(), zero_knob())
+                .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        // Interpolated and extrapolated points; the fit is deterministic.
+        for u in [500usize, 2_000, 5_000, 7_800, 11_000] {
+            let got = trace
+                .first_token_delay(&mut rng, &ctx(u, 0, false, 1))
+                .as_secs_f64()
+                * 1000.0;
+            let want = quad_ms(u as f64);
+            assert!(
+                (got - want).abs() / want < 0.05,
+                "T({u}) = {got:.1}ms, want ~{want:.1}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_service_fit_ignores_loaded_records() {
+        // Queued observations at higher concurrency must not bend the floor.
+        let mut records = quad_floor_records();
+        for i in 0..12 {
+            let u = 100 + 700 * i;
+            for _ in 0..6 {
+                records.push(make_record(u, 2, quad_ms(u as f64) + 400.0, vec![10.0], 9));
+            }
+        }
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &records, zero_knob()).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let got = trace
+            .first_token_delay(&mut rng, &ctx(5_000, 0, false, 1))
+            .as_secs_f64()
+            * 1000.0;
+        let want = quad_ms(5_000.0);
+        assert!(
+            (got - want).abs() / want < 0.05,
+            "loaded records leaked into the fit: T(5000) = {got:.1}ms, want ~{want:.1}ms"
+        );
+    }
+
+    #[test]
+    fn trace_service_fit_clamps_to_floor() {
+        let trace =
+            TraceLatency::from_records(TraceMeta::default(), &quad_floor_records(), zero_knob())
+                .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        // u=1: the raw curve sits near its intercept; the clamp keeps the
+        // result at or above the smallest observed window floor.
+        let got = trace
+            .first_token_delay(&mut rng, &ctx(1, 0, false, 1))
+            .as_secs_f64()
+            * 1000.0;
+        let floor = quad_ms(100.0);
+        assert!(
+            got >= floor - 1e-9,
+            "T(1) = {got:.1}ms dipped under the observed floor {floor:.1}ms"
+        );
+    }
 
     fn zero_knob() -> KnobLatency {
         model()
