@@ -460,8 +460,12 @@ type PullCompletion = (String, Result<u64>);
 struct PrefillWindow {
     start: Instant,
     end: Instant,
-    /// Chunk-step count: tokens due inside the window slip to chunk boundaries.
-    chunks: u32,
+    /// Uncached prompt tokens, placing the chunk boundaries tokens due inside the
+    /// window slip to. Boundaries sit at token-proportional positions (one per chunk
+    /// budget), so a full first chunk spans most of the window and a trailing partial
+    /// chunk only its share - which is what spreads slipped gaps the way real marked
+    /// gaps spread, instead of capping them all at window/chunk-count.
+    uncached: u32,
     /// Whether this prefill found the engine already loaded at admission: it queued
     /// behind the stream tail, or the running batch was past the heaviest load real
     /// captures show the engine hiding chunks at (zero decode elongation up to
@@ -980,7 +984,7 @@ impl SimEngine {
                     self.prefill_busy.push_back(PrefillWindow {
                         start,
                         end,
-                        chunks,
+                        uncached: uncached as u32,
                         stalls_decodes: start > now || num_running > CHUNK_HIDING_MAX_RUNNING,
                     });
                 }
@@ -1207,9 +1211,12 @@ impl SimEngine {
                     if w.stalls_decodes {
                         let dur = w.end.duration_since(w.start).as_secs_f64();
                         let into = due.duration_since(w.start).as_secs_f64();
-                        let n = w.chunks.max(1) as f64;
-                        let boundary = (into / dur * n).ceil().clamp(1.0, n);
-                        next = w.start + Duration::from_secs_f64(dur * boundary / n);
+                        let budget = (self.opt.max_num_batched_tokens as f64).max(1.0);
+                        let tokens = f64::from(w.uncached.max(1));
+                        let token_pos = into / dur * tokens;
+                        let boundary_tokens =
+                            ((token_pos / budget).ceil().max(1.0) * budget).min(tokens);
+                        next = w.start + Duration::from_secs_f64(dur * boundary_tokens / tokens);
                     }
                     break;
                 }
