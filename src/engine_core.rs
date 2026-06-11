@@ -48,7 +48,7 @@ pub(crate) trait EngineCore: Send {
 pub(crate) async fn run_loop<E: EngineCore>(
     mut engine: E,
     mut input_rx: mpsc::UnboundedReceiver<EngineInput>,
-    output_tx: mpsc::Sender<EngineOutput>,
+    output_tx: mpsc::UnboundedSender<EngineOutput>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let mut internal_rx = engine.take_internal_rx();
@@ -75,10 +75,13 @@ pub(crate) async fn run_loop<E: EngineCore>(
             }
         };
 
+        // The send must never await: the step loop IS the engine clock, and
+        // backpressure from a lagging consumer was measured stalling it for
+        // 35-170ms bursts (16% of emissions late). A real engine fires its
+        // outputs into the socket without pacing on the reader.
         for output in outputs {
             output_tx
                 .send(output)
-                .await
                 .map_err(|_| anyhow!("engine IO task shut down"))?;
         }
     }
@@ -169,7 +172,7 @@ mod tests {
     async fn constant_engine_through_run_loop() {
         let engine = ConstantEngine::new(42);
         let (input_tx, input_rx) = mpsc::unbounded_channel();
-        let (output_tx, mut output_rx) = mpsc::channel(16);
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
 
         let shutdown_clone = shutdown.clone();

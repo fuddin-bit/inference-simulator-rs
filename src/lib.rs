@@ -403,7 +403,7 @@ async fn run_engine(engine_index: u32, opt: Opt, shutdown: CancellationToken) ->
     info!(engine_index, role = ?opt.pd_role, "engine connected to frontend");
 
     let (input_tx, input_rx) = mpsc::unbounded_channel();
-    let (output_tx, output_rx) = mpsc::channel(64);
+    let (output_tx, output_rx) = mpsc::unbounded_channel();
 
     let mut io_loop = tokio::spawn(io::run_io_loop(
         data_sockets,

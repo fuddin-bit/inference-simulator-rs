@@ -95,7 +95,7 @@ fn decode_request(message: ZmqMessage) -> Result<EngineInput> {
 pub(crate) async fn run_io_loop(
     data_sockets: Vec<MockEngineDataSockets>,
     input_tx: mpsc::UnboundedSender<EngineInput>,
-    mut output_rx: mpsc::Receiver<EngineOutput>,
+    mut output_rx: mpsc::UnboundedReceiver<EngineOutput>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let (dealers, mut push_sockets): (Vec<_>, Vec<_>) = data_sockets
