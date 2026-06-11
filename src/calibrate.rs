@@ -776,7 +776,7 @@ fn request_total_report(
                     if let Some(ctx) = &r.itl_ctx
                         && ctx.prefill_tokens[i] > 0
                     {
-                        pacing.note_prefill(ctx.prefill_tokens[i]);
+                        pacing.note_prefill(ctx.prefill_tokens[i], u32::MAX);
                     }
                     model
                         .paced_inter_token_delay(&mut rng, r.concurrency, &mut pacing)
