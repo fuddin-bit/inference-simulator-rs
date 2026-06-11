@@ -1081,6 +1081,11 @@ pub struct ReplayArrivalsConfig<'a> {
     /// trace carries block_hashes (the chains still drive session inference).
     /// The TTFT delta vs a normal replay is the prefix cache's contribution.
     pub cold_prompts: bool,
+    /// Time compression factor: the sim divides its delays by this, the
+    /// harness compresses the schedule and re-multiplies measurements. Inner
+    /// calibration loops run faster at the cost of timer-granularity fidelity;
+    /// final validation should use 1.0.
+    pub time_scale: f64,
 }
 
 /// For each record (arrival-ordered), the index of its session parent: the
@@ -1226,6 +1231,11 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     let (meta, all_records) = read_trace(std::io::BufReader::new(file))
         .with_context(|| format!("parsing trace: {}", cfg.trace_path.display()))?;
     let block_size = meta.block_size.unwrap_or(16);
+    let time_scale = if cfg.time_scale > 0.0 {
+        cfg.time_scale
+    } else {
+        1.0
+    };
 
     let mut subset: Vec<TraceRecord> = all_records
         .into_iter()
@@ -1304,6 +1314,9 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
             latency_path.to_string_lossy().to_string(),
         ]);
     }
+    if time_scale != 1.0 {
+        args.extend(["--time-scale".to_string(), time_scale.to_string()]);
+    }
     args.extend(cfg.extra_sim_args.iter().cloned());
 
     let opt = crate::Opt::parse_from(&args);
@@ -1342,8 +1355,9 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
                 roots += 1;
                 continue;
             };
-            let think_ms =
-                (subset[i].arrival_ms.unwrap_or(0.0) - source_completion_ms(&subset[p])).max(0.0);
+            let think_ms = (subset[i].arrival_ms.unwrap_or(0.0) - source_completion_ms(&subset[p]))
+                .max(0.0)
+                / time_scale;
             let (tx, rx) = tokio::sync::oneshot::channel();
             child_txs[p].push(tx);
             triggers[i] = Some((rx, think_ms));
@@ -1358,7 +1372,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
     let mut handles = Vec::with_capacity(subset.len());
     for (i, rec) in subset.iter().enumerate() {
         let offset_ms = (rec.arrival_ms.unwrap_or(first_arrival) - first_arrival).max(0.0);
-        let target = base + Duration::from_secs_f64(offset_ms / 1000.0);
+        let target = base + Duration::from_secs_f64(offset_ms / 1000.0 / time_scale);
         // Reconstruct prefix sharing when the capture fingerprinted it;
         // otherwise every prompt is unique (cold cache, matching the capture).
         let prompt = match rec.block_hashes.as_deref() {
@@ -1378,7 +1392,7 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
                 .map(|g| g.iter().sum::<f64>())
                 .or_else(|| rec.itl_summary.as_ref().map(|s| s.mean_ms * s.count as f64))
                 .unwrap_or(0.0);
-        let timeout_dur = Duration::from_secs_f64(60.0 + 5.0 * source_ms / 1000.0);
+        let timeout_dur = Duration::from_secs_f64(60.0 + 5.0 * source_ms / 1000.0 / time_scale);
         let client = Arc::clone(&client);
         let trigger = triggers[i].take();
         let txs = std::mem::take(&mut child_txs[i]);
@@ -1409,7 +1423,13 @@ pub async fn replay_arrivals(cfg: &ReplayArrivalsConfig<'_>) -> Result<ArrivalRe
                 }),
                 ..Default::default()
             };
-            let (ttft_ms, gaps_ms) = measure_one(&client, request, timeout_dur).await;
+            let (ttft_ms, mut gaps_ms) = measure_one(&client, request, timeout_dur).await;
+            let ttft_ms = ttft_ms.map(|t| t * time_scale);
+            if time_scale != 1.0 {
+                for g in &mut gaps_ms {
+                    *g *= time_scale;
+                }
+            }
             // Release dependent turns even when this one failed: the session
             // must keep pacing or the replay deadlocks on errors.
             for tx in txs {

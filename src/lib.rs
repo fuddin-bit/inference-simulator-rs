@@ -263,6 +263,13 @@ pub struct Opt {
     #[arg(long, default_value_t = 0.0)]
     pub failure_injection_rate: f64,
 
+    /// Divide every model delay by this factor (time compression for fast
+    /// calibration loops). Wire-level measurements must be re-multiplied by
+    /// the same factor; timer granularity and transport jitter do not scale,
+    /// so fidelity degrades as the factor grows. `1.0` is real time.
+    #[arg(long, default_value_t = 1.0)]
+    pub time_scale: f64,
+
     /// Failure kinds to inject (one is chosen uniformly per injected failure).
     #[arg(long, value_enum, value_delimiter = ',', default_value = "error")]
     pub failure_types: Vec<FailureType>,

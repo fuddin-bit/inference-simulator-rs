@@ -241,6 +241,7 @@ async fn replay_arrivals_constant_trace() {
             extra_sim_args: Vec::new(),
             session_replay: false,
             cold_prompts: false,
+            time_scale: 1.0,
         };
         let outcome = calibrate::replay_arrivals(&cfg).await.expect("replay should run");
 
@@ -298,6 +299,7 @@ async fn replay_arrivals_requires_arrival_ms() {
         extra_sim_args: Vec::new(),
         session_replay: false,
         cold_prompts: false,
+        time_scale: 1.0,
     };
     let err = calibrate::replay_arrivals(&cfg)
         .await

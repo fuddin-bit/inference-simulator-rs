@@ -133,6 +133,11 @@ enum Command {
         /// delta vs a normal replay is the prefix cache's contribution.
         #[arg(long, requires = "replay_arrivals")]
         cold_prompts: bool,
+        /// With --replay-arrivals: time compression (sim delays divided by
+        /// this, measurements re-multiplied). Faster inner loops, slightly
+        /// noisier quantiles; use 1.0 for final validation.
+        #[arg(long, default_value_t = 1.0, requires = "replay_arrivals")]
+        time_scale: f64,
         /// With --replay-arrivals: extra flag tokens for the in-process sim,
         /// repeated per token (e.g. --sim-arg=--kv-cache-size --sim-arg=8192).
         /// Must mirror the capture engine's scheduler/cache config.
@@ -246,6 +251,7 @@ fn run() -> Result<ExitCode> {
             dump_trace,
             replay_sessions,
             cold_prompts,
+            time_scale,
             sim_args,
             json,
         } => {
@@ -265,6 +271,7 @@ fn run() -> Result<ExitCode> {
                     extra_sim_args: sim_args,
                     session_replay: replay_sessions,
                     cold_prompts,
+                    time_scale,
                 };
                 let outcome = runtime.block_on(calibrate::replay_arrivals(&cfg))?;
                 eprintln!(

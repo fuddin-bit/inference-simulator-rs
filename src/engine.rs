@@ -5,7 +5,7 @@
 //! Everything wire-facing comes from the `vllm-engine-core-client` crate, so this
 //! stays correct as the protocol evolves upstream.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -343,6 +343,11 @@ impl ActiveRequest {
                 num_running,
             },
         );
+        let time_scale = if opt.time_scale > 0.0 {
+            opt.time_scale
+        } else {
+            1.0
+        };
         // Step alignment: when other requests are mid-step, a new prefill waits
         // for the in-flight step before its chunk runs, so the first token lands
         // roughly one inter-token gap later. The paced draw conditions that gap
@@ -368,7 +373,7 @@ impl ActiveRequest {
             num_local_cached_tokens,
             block_ids,
             lora_name,
-            next_at: Instant::now() + first_delay + step_wait,
+            next_at: Instant::now() + (first_delay + step_wait).div_f64(time_scale),
         })
     }
 
@@ -468,14 +473,14 @@ pub(crate) struct SimEngine {
     /// utility calls; per-request usage drives the `running/waiting_lora_adapters` stats.
     loras: LoraRegistry,
     /// The running batch: requests being actively decoded. Capped at `max_num_seqs`.
-    active_requests: HashMap<String, ActiveRequest>,
+    active_requests: BTreeMap<String, ActiveRequest>,
     /// Admitted-but-not-yet-running requests, in arrival order. Drained into `active_requests`
     /// as slots free up; its length is `vllm:num_requests_waiting`.
     waiting: VecDeque<Box<EngineCoreRequest>>,
     /// Requests whose blocks are pinned and batch slot reserved, but whose remote KV pull
     /// is still in flight. These count toward `running_capacity` and `scheduled_token_demand`
     /// to prevent over-admission while pulls are outstanding.
-    pending_pulls: HashMap<String, PendingPull>,
+    pending_pulls: BTreeMap<String, PendingPull>,
     /// Sender half for pull completion results. Cloned into each `spawn_blocking` task.
     pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
     /// Receiver half; wrapped in Option so `take_internal_rx` can hand it to the loop once.
@@ -1115,12 +1120,17 @@ impl SimEngine {
                     );
                 }
             } else {
-                request.next_at = now
-                    + self.latency.paced_inter_token_delay(
-                        &mut request.rng,
-                        num_running,
-                        &mut request.pacing,
-                    );
+                let gap = self.latency.paced_inter_token_delay(
+                    &mut request.rng,
+                    num_running,
+                    &mut request.pacing,
+                );
+                let time_scale = if self.opt.time_scale > 0.0 {
+                    self.opt.time_scale
+                } else {
+                    1.0
+                };
+                request.next_at = now + gap.div_f64(time_scale);
             }
 
             let (outs, finished_set) = by_client
@@ -1286,9 +1296,9 @@ impl SimEngine {
                 opt_seed ^ (engine_index as u64).wrapping_mul(0x9e3779b9),
             ),
             loras: LoraRegistry::new(max_loras),
-            active_requests: HashMap::new(),
+            active_requests: BTreeMap::new(),
             waiting: VecDeque::new(),
-            pending_pulls: HashMap::new(),
+            pending_pulls: BTreeMap::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
         })
@@ -1379,9 +1389,9 @@ mod tests {
             events: None,
             failure_rng: StdRng::seed_from_u64(opt.seed),
             loras: LoraRegistry::new(opt.max_loras as usize),
-            active_requests: HashMap::new(),
+            active_requests: BTreeMap::new(),
             waiting: VecDeque::new(),
-            pending_pulls: HashMap::new(),
+            pending_pulls: BTreeMap::new(),
             pull_completion_tx,
             pull_completion_rx: Some(pull_completion_rx),
             opt,
