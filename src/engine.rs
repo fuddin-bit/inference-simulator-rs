@@ -486,11 +486,13 @@ pub(crate) struct SimEngine {
     /// is still in flight. These count toward `running_capacity` and `scheduled_token_demand`
     /// to prevent over-admission while pulls are outstanding.
     pending_pulls: BTreeMap<String, PendingPull>,
-    /// The engine's serial prefill stream as busy windows of (scaled) wall time, in order.
-    /// Prefill chunks and decode steps share one step stream, so a decode token due inside
-    /// a window slips past it: its gap absorbs whatever chunk compute drains within it.
-    /// Windows whose end has passed are dropped at the next admission or step.
-    prefill_busy: VecDeque<(Instant, Instant)>,
+    /// The engine's serial prefill stream as busy windows of (scaled) wall time plus the
+    /// window's chunk-step count, in order. Prefill chunks and decode steps share one step
+    /// stream, so a decode token due inside a window slips to the next chunk-step boundary
+    /// (decodes ride along in mixed batches, emitting once per chunk step, so one prefill
+    /// elongates several consecutive gaps to roughly a chunk's duration each rather than
+    /// one gap to the whole window). Drained windows are dropped at the next admission.
+    prefill_busy: VecDeque<(Instant, Instant, u32)>,
     /// Sender half for pull completion results. Cloned into each `spawn_blocking` task.
     pull_completion_tx: mpsc::UnboundedSender<PullCompletion>,
     /// Receiver half; wrapped in Option so `take_internal_rx` can hand it to the loop once.
@@ -935,7 +937,7 @@ impl SimEngine {
                 while self
                     .prefill_busy
                     .front()
-                    .is_some_and(|&(_, end)| end <= now)
+                    .is_some_and(|&(_, end, _)| end <= now)
                 {
                     self.prefill_busy.pop_front();
                 }
@@ -945,13 +947,16 @@ impl SimEngine {
                     } else {
                         1.0
                     };
+                    let budget = (self.opt.max_num_batched_tokens as usize).max(1);
+                    let uncached = active.prompt_len - num_local_cached;
+                    let chunks = uncached.div_ceil(budget) as u32;
                     let start = match self.prefill_busy.back() {
-                        Some(&(_, end)) if end > now => end,
+                        Some(&(_, end, _)) if end > now => end,
                         _ => now,
                     };
                     let end = start + active.prefill_service.div_f64(time_scale);
                     active.next_at += start.saturating_duration_since(now);
-                    self.prefill_busy.push_back((start, end));
+                    self.prefill_busy.push_back((start, end, chunks));
                 }
                 self.active_requests.insert(request_id, active);
                 None
@@ -1153,23 +1158,27 @@ impl SimEngine {
                 } else {
                     1.0
                 };
-                // Walk the gap through the serial prefill stream: the token
-                // needs `gap` of chunk-free engine time, so each busy window
-                // it crosses pushes it out by that window's remainder.
-                let mut remaining = gap.div_f64(time_scale);
-                let mut pos = now;
-                for &(start, end) in &self.prefill_busy {
-                    if end <= pos {
+                // A token due inside a prefill busy window rides that window's
+                // mixed chunk steps: it emits at the next chunk-step boundary,
+                // so one prefill stretches several consecutive gaps to about a
+                // chunk each instead of one gap to the whole window.
+                let due = now + gap.div_f64(time_scale);
+                let mut next = due;
+                for &(start, end, chunks) in &self.prefill_busy {
+                    if end <= due {
                         continue;
                     }
-                    let free = start.saturating_duration_since(pos);
-                    if remaining <= free {
+                    if start >= due {
                         break;
                     }
-                    remaining -= free;
-                    pos = end;
+                    let dur = end.duration_since(start).as_secs_f64();
+                    let into = due.duration_since(start).as_secs_f64();
+                    let n = chunks.max(1) as f64;
+                    let boundary = (into / dur * n).ceil().clamp(1.0, n);
+                    next = start + Duration::from_secs_f64(dur * boundary / n);
+                    break;
                 }
-                request.next_at = pos + remaining;
+                request.next_at = next;
             }
 
             let (outs, finished_set) = by_client
