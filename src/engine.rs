@@ -1423,8 +1423,12 @@ impl SimEngine {
             };
             match adv_result {
                 Ok(remote) => {
+                    // One flush can carry several outputs for the request
+                    // (catch-up); the descriptor rides the finishing one.
                     if let Some((outs, _)) = by_client.get_mut(&client_index)
-                        && let Some(out) = outs.iter_mut().find(|o| o.request_id == request_id)
+                        && let Some(out) = outs
+                            .iter_mut()
+                            .find(|o| o.request_id == request_id && o.finish_reason.is_some())
                     {
                         out.kv_transfer_params =
                             Some(build_prefill_kv_params(&remote, &request_id, num_tokens));
