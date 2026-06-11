@@ -38,7 +38,11 @@ Wiring rules:
    positional, so the engine image must match the protocol commit the tap was
    built against (see `Cargo.toml`'s `vllm-engine-core-client` rev).
 
-Container snippet (see `h200-capture.yaml` for the full three-container pod):
+To inject the tap into an existing disaggregated deployment, use the
+kustomize patch template [`tap-sidecar-patch.yaml`](tap-sidecar-patch.yaml)
+(tap container + trace volume + the engine's rpc-port re-point). The
+standalone container snippet (see `h200-capture.yaml` for the full
+three-container pod):
 
 ```yaml
 - name: tap
