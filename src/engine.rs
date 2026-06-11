@@ -462,10 +462,18 @@ struct PrefillWindow {
     end: Instant,
     /// Chunk-step count: tokens due inside the window slip to chunk boundaries.
     chunks: u32,
-    /// Whether this prefill queued behind the stream tail at admission. Only queued
-    /// windows stall decodes; an isolated prefill's chunk is hidden by the engine.
-    queued: bool,
+    /// Whether this prefill found the engine already loaded at admission: it queued
+    /// behind the stream tail, or the running batch was past the heaviest load real
+    /// captures show the engine hiding chunks at (zero decode elongation up to
+    /// concurrency 8 at light load; full chunk-step stalls near saturation). Only
+    /// loaded windows stall decodes; an isolated prefill's chunk is hidden.
+    stalls_decodes: bool,
 }
+
+/// Largest running batch at which real captures still show ZERO decode elongation from
+/// a prefill admission (held-out multiturn capture, concurrency <= 8, surcharge ~0.1ms).
+/// Past it the engine's chunk-hiding capacity is exhausted and decodes ride chunk steps.
+const CHUNK_HIDING_MAX_RUNNING: u64 = 8;
 
 pub(crate) struct SimEngine {
     engine_index: u32,
@@ -969,7 +977,7 @@ impl SimEngine {
                         start,
                         end,
                         chunks,
-                        queued: start > now,
+                        stalls_decodes: start > now || num_running > CHUNK_HIDING_MAX_RUNNING,
                     });
                 }
                 self.active_requests.insert(request_id, active);
@@ -1176,7 +1184,8 @@ impl SimEngine {
                 // window's mixed chunk steps: it emits at the next chunk-step
                 // boundary, so one prefill stretches several consecutive gaps
                 // to about a chunk each instead of one gap to the whole
-                // window. Isolated (unqueued) windows stall nothing.
+                // window. Windows from isolated light-load admissions stall
+                // nothing (the engine hides those chunks entirely).
                 let due = now + gap.div_f64(time_scale);
                 let mut next = due;
                 for w in &self.prefill_busy {
@@ -1186,7 +1195,7 @@ impl SimEngine {
                     if w.start >= due {
                         break;
                     }
-                    if w.queued {
+                    if w.stalls_decodes {
                         let dur = w.end.duration_since(w.start).as_secs_f64();
                         let into = due.duration_since(w.start).as_secs_f64();
                         let n = w.chunks.max(1) as f64;
