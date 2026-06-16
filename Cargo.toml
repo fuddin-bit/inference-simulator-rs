@@ -18,7 +18,7 @@ sim-tap = { path = "crates/sim-tap" }
 
 # The real vLLM engine-core protocol + reusable mock-engine handshake harness,
 # pulled straight from the in-tree Rust frontend so the wire format never drifts.
-vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "c9340e6f350a009cf835878abad2a0e379b9e6a4" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm.git", rev = "16e91176cf77bf0f40ae48da22365a5e21b517af" }
 
 anyhow = "1.0.100"
 clap = { version = "4.5.38", features = ["derive", "env"] }
@@ -82,3 +82,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zeromq = { workspace = true }
 flate2 = { workspace = true }
+
+# Fork patch: adds missing `#[serde(default)]` to EngineCoreSamplingParams so the
+# tap decodes real Python-encoded requests (msgspec omit_defaults drops fields at
+# their default, e.g. `temperature`). Branch off the deployed engine rev
+# 16e91176; upstream PR pending. See
+# deploy/trace-capture/diffusiongemma-mm-frame-findings.md.
+[patch."https://github.com/vllm-project/vllm.git"]
+vllm-engine-core-client = { git = "https://github.com/wseaton/vllm.git", rev = "492e15503a1098192a366beccab09396e084a21e" }

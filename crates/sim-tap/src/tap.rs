@@ -427,49 +427,136 @@ pub async fn run_tap<W: Write, S: Write>(
     // ROUTER socket needs it as the first frame of every forwarded request.
     let engine_identity = EngineId::from_engine_index(0).to_frame();
 
-    loop {
+    // Drain the two RECEIVE sockets in dedicated tasks rather than awaiting their
+    // `recv()` directly in the `select!` below.
+    //
+    // zmq.rs reads are poll-driven (no background reader): a socket only drains
+    // its TCP buffer while its `recv()` future is being polled. A `select!` over
+    // two `Socket::recv()` futures DROPS (cancels) the non-winning future every
+    // iteration, so a large multi-frame message (e.g. multimodal pixel tensors,
+    // tens of MB across several frames) that needs many polls to arrive can stall
+    // mid-flight while the other branch keeps firing. Observed live: an 11 MB
+    // multimodal request sat unread in the dealer's TCP Recv-Q while the loop
+    // serviced engine outputs, wedging the whole proxy (every later request,
+    // text included, head-of-line blocked behind it).
+    //
+    // Each drain task owns its socket and calls `recv()` in a tight, never-
+    // cancelled loop, forwarding (arrival_instant, message) over an unbounded
+    // channel. The proxy loop then selects over the CHANNELS, whose `recv()` is
+    // cancel-safe (a queue pop), and does the forwarding sends in the body. The
+    // sockets are therefore always being drained regardless of which side is
+    // busy. Arrival is stamped inside the drain task, closest to the wire.
+    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<(Instant, ZmqMessage)>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<(Instant, ZmqMessage)>();
+
+    let req_drain = tokio::spawn(async move {
+        loop {
+            match downstream_dealer.recv().await {
+                Ok(message) => {
+                    if req_tx.send((Instant::now(), message)).is_err() {
+                        break; // proxy loop gone
+                    }
+                }
+                Err(e) => {
+                    warn!(%e, "tap: downstream dealer recv error, stopping request drain");
+                    break;
+                }
+            }
+        }
+    });
+
+    let out_drain = tokio::spawn(async move {
+        loop {
+            match upstream_output.recv().await {
+                Ok(message) => {
+                    if out_tx.send((Instant::now(), message)).is_err() {
+                        break; // proxy loop gone
+                    }
+                }
+                Err(e) => {
+                    warn!(%e, "tap: upstream output recv error, stopping output drain");
+                    break;
+                }
+            }
+        }
+    });
+
+    let proxy_result: Result<()> = loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
                 info!("tap shutting down");
-                break;
+                break Ok(());
             }
 
             // Downstream -> Upstream: frames from the frontend to the engine.
             // The dealer receives [request_type, payload] frames.
             //
-            // Stamp arrival, forward first, observe after: the timestamp is taken
-            // at the wire, but the observation decode stays out of the forwarding
-            // path. Frame clones are Bytes refcount bumps, not copies.
-            result = downstream_dealer.recv() => {
-                let message = result.context("receiving from frontend")?;
-                let arrival = Instant::now();
+            // Forward first, observe after: the observation decode stays out of
+            // the forwarding path. Frame clones are Bytes refcount bumps, not
+            // copies.
+            req = req_rx.recv() => {
+                let Some((arrival, message)) = req else {
+                    break Err(anyhow!("request drain task ended (frontend disconnected)"));
+                };
                 let frames = message.into_vec();
+
+                // DIAG: frame structure of each frontend->engine message. Multimodal
+                // requests carry mm tensors as extra aux frames; if image requests show
+                // the same frame count as text, the mm data is on a channel we don't tap.
+                info!(
+                    n_frames = frames.len(),
+                    sizes = ?frames.iter().map(|f| f.len()).collect::<Vec<_>>(),
+                    "DIAG downstream->upstream request frames"
+                );
+                // DIAG: decode the request to see if it carries mm_features (and how
+                // many prompt tokens).
+                if frames.len() >= 2 && EngineCoreRequestType::from_frame(frames[0].as_ref()) == Some(EngineCoreRequestType::Add) {
+                    match decode_msgpack::<EngineCoreRequest>(frames[1].as_ref()) {
+                        Ok(req) => info!(
+                            request_id = %req.request_id,
+                            mm_features = req.mm_features.is_some(),
+                            prompt_tokens = req.prompt_token_ids.as_ref().map(|p| p.len()).unwrap_or(0),
+                            "DIAG decoded Add request"
+                        ),
+                        Err(e) => warn!(%e, "DIAG failed to decode Add request"),
+                    }
+                }
 
                 // Forward verbatim to the upstream engine, prefixed with the
                 // engine's ROUTER identity.
                 let mut router_frames = vec![engine_identity.clone()];
                 router_frames.extend(frames.iter().cloned());
-                let fwd = ZmqMessage::try_from(router_frames)
-                    .map_err(|e| anyhow!("building router forward message: {e}"))?;
-                upstream_input.send(fwd).await
-                    .context("forwarding request to engine")?;
+                let fwd = match ZmqMessage::try_from(router_frames) {
+                    Ok(fwd) => fwd,
+                    Err(e) => break Err(anyhow!("building router forward message: {e}")),
+                };
+                if let Err(e) = upstream_input.send(fwd).await {
+                    break Err(anyhow!("forwarding request to engine: {e}"));
+                }
 
                 // Decode a copy for observation.
                 observe_request(&frames, &mut requests, arrival, config.block_size);
             }
 
             // Upstream -> Downstream: frames from the engine to the frontend.
-            result = upstream_output.recv() => {
-                let message = result.context("receiving from engine")?;
-                let arrival = Instant::now();
+            out = out_rx.recv() => {
+                let Some((arrival, message)) = out else {
+                    break Err(anyhow!("output drain task ended (engine disconnected)"));
+                };
                 let frames = message.into_vec();
 
+                // DIAG: any engine->frontend output means the engine processed a request.
+                info!(n_frames = frames.len(), "DIAG upstream->downstream output frames");
+
                 // Forward verbatim to the frontend via the PUSH socket.
-                let fwd = ZmqMessage::try_from(frames.clone())
-                    .map_err(|e| anyhow!("building push forward message: {e}"))?;
-                downstream_push.send(fwd).await
-                    .context("forwarding output to frontend")?;
+                let fwd = match ZmqMessage::try_from(frames.clone()) {
+                    Ok(fwd) => fwd,
+                    Err(e) => break Err(anyhow!("building push forward message: {e}")),
+                };
+                if let Err(e) = downstream_push.send(fwd).await {
+                    break Err(anyhow!("forwarding output to frontend: {e}"));
+                }
 
                 // Decode a copy for observation; the trace write at request
                 // completion also lands here, after the frame is already out.
@@ -484,7 +571,13 @@ pub async fn run_tap<W: Write, S: Write>(
                 );
             }
         }
-    }
+    };
+
+    // Stop the drain tasks: they park in `recv()` and won't notice the dropped
+    // channel, so abort them outright.
+    req_drain.abort();
+    out_drain.abort();
+    proxy_result?;
 
     writer.flush().context("flushing trace writer")?;
     Ok(())
@@ -498,10 +591,17 @@ fn observe_request<F: AsRef<[u8]>>(
     arrival: Instant,
     block_size: usize,
 ) {
-    if frames.len() != 2 {
+    // A request is `[request_type, msgpack_blob, aux_tensor_frame...]`: text
+    // requests are 2 frames, but a multimodal request appends one aux frame per
+    // large tensor (image pixel values, tens of MB), so it carries 3+ frames. The
+    // msgpack blob in frames[1] decodes on its own (large tensors ride as aux
+    // indices, resolved later by the engine), so observation only needs the first
+    // two frames; the aux tensor payload is irrelevant to timing. Requiring
+    // exactly 2 frames silently dropped every multimodal request from the trace.
+    if frames.len() < 2 {
         warn!(
             frame_count = frames.len(),
-            "unexpected request frame count, skipping observation"
+            "request has fewer than 2 frames, skipping observation"
         );
         return;
     }
@@ -744,5 +844,38 @@ mod tests {
             record.itl_tokens, None,
             "plain autoregressive captures keep the pre-spec schema"
         );
+    }
+
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        let hex = hex.trim();
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    /// A real DiffusionGemma multimodal `Add` arrives as `[request_type,
+    /// msgpack_blob, aux_tensor...]` (3+ frames, the pixel tensor riding as an
+    /// aux frame). `observe_request` must track it; the old `frames.len() != 2`
+    /// guard dropped every multimodal request, so the engine generated tokens but
+    /// no trace record was ever written.
+    #[test]
+    fn observe_request_tracks_multimodal_add_with_aux_frames() {
+        // frames[1] is the genuine MsgpackEncoder blob (rev 16e91176); the aux
+        // pixel tensor is a stand-in here since observation never touches it.
+        let msgpack = hex_to_bytes(include_str!("../tests/fixtures/mm_request_large_aux.hex"));
+        let frames: Vec<Vec<u8>> = vec![
+            EngineCoreRequestType::Add.to_frame().to_vec(), // request_type
+            msgpack,                                        // msgpack blob
+            vec![0xABu8; 4096],                             // aux pixel tensor (ignored)
+        ];
+
+        let mut requests: HashMap<String, RequestState> = HashMap::new();
+        observe_request(&frames, &mut requests, Instant::now(), 16);
+
+        assert_eq!(requests.len(), 1, "multimodal Add must be tracked");
+        let state = requests.get("req-mm-large").expect("request_id tracked");
+        // 2 text + 256 image placeholders + 1 text (matches the groundtruth test).
+        assert_eq!(state.prompt_tokens, 259);
     }
 }
