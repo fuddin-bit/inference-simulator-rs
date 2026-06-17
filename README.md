@@ -1,24 +1,24 @@
 # inference-simulator-rs
 
-A mock vLLM **V1 engine-core** backend that speaks the real ZMQ + msgpack protocol,
-with a prefill/decode **KV data plane over NIXL** so you can exercise P/D flows,
-including actual byte movement over CPU RDMA / shared memory, **without a GPU or a
-model**.
+A vLLM **V1 engine-core** simulator that speaks the ZMQ + msgpack protocol.
+It can run behind a vLLM frontend without model weights or a GPU. With the
+`nixl` feature and a working libnixl/UCX runtime, it also moves simulated
+KV-cache bytes over NIXL for prefill/decode testing.
 
 ## Table of contents
 
-- [Why](#why)
-- [How it works](#how-it-works)
+- [Purpose](#purpose)
+- [Architecture](#architecture)
 - [Status](#status)
 - [Quick start](#quick-start)
 - [Testing](#testing)
 - [LoRA simulation](#lora-simulation)
 - [NIXL data plane](#nixl-data-plane)
-- [Hacking the engine](#hacking-the-engine)
+- [Engine internals](#engine-internals)
 - [Trace replay and calibration](#trace-replay-and-calibration)
   - [Concepts](#concepts)
   - [Calibration demo](#calibration-demo)
-  - [Calibration against a real engine](#calibration-against-a-real-engine)
+  - [Calibration with engine captures](#calibration-with-engine-captures)
   - [Open-loop arrival replay](#open-loop-arrival-replay)
   - [Prefix cache and agentic multiturn](#prefix-cache-and-agentic-multiturn)
   - [Content-identical replay](#content-identical-replay)
@@ -27,33 +27,32 @@ model**.
 - [Dependencies of note](#dependencies-of-note)
 - [License](#license)
 
-## Why
+## Purpose
 
-`llm-d-inference-sim` today fakes prefill/decode purely in the control plane: it
-adjusts the latency model and tags a finish reason, but no KV cache bytes ever move.
-This project takes a different approach on two fronts:
+`llm-d-inference-sim` models prefill/decode in the control plane: it adjusts
+latency and finish metadata, but it does not move KV-cache bytes. This simulator
+adds two capabilities:
 
-1. **Frontend testing against a real frontend.** Instead of reimplementing the
-   OpenAI API surface, sit behind vLLM's *real* frontend (the in-tree Rust frontend,
-   or the Python one) as a drop-in engine. The frontend does tokenization, chat
-   templates, tool calling, streaming, and the edge cases. Only the model is faked.
-2. **A real P/D data path.** The same fake engine moves simulated-KV bytes between a
-   prefill instance and a decode instance over
-   [NIXL](https://github.com/ai-dynamo/nixl) (UCX backend: DRAM-to-DRAM or real RDMA
-   NICs). No CUDA, no GPU.
+1. **Frontend compatibility.** It runs behind vLLM's Rust or Python frontend. The
+   frontend still handles tokenization, chat templates, tool calling, streaming, and
+   OpenAI-compatible request handling. The simulator replaces only the model backend.
+2. **Prefill/decode data-plane testing.** It can move simulated KV-cache bytes
+   between prefill and decode instances over [NIXL](https://github.com/ai-dynamo/nixl)
+   using the UCX backend when the NIXL runtime initializes. CUDA and model weights
+   are not required.
 
-## How it works
+## Architecture
 
 The protocol boundary is reused from vLLM's in-tree `vllm-engine-core-client` crate
-(pulled as a pinned git dependency), so the wire format tracks upstream:
+(pulled as a pinned git dependency):
 
 ```
-            ZMQ + msgpack (real engine-core protocol)
+            ZMQ + msgpack (engine-core protocol)
  vLLM frontend  ◀──────────────────────────────────▶  inference-simulator-rs
  (Rust or Py)        handshake / ADD / ABORT / UTILITY        │
                                                               ▼
                                               ┌──────────────────────────────┐
-                                              │ generation loop (fake tokens) │
+                                              │ generation loop (sim tokens)  │
                                               │           │                   │
                                               │           ▼                   │
                                               │   KvDataPlane (the boundary)  │
@@ -62,20 +61,20 @@ The protocol boundary is reused from vLLM's in-tree `vllm-engine-core-client` cr
                                               └──────────────────────────────┘
 ```
 
-- `connect_to_frontend` (from the reused crate) joins the frontend-owned handshake,
+- `connect_to_frontend` joins the frontend-owned handshake,
   reports ready, and opens the DEALER/PUSH sockets.
 - `src/io.rs` decodes frames into `EngineInput` and pushes `EngineOutput` back.
 - `src/engine.rs` is the generation loop (random tokens to `max_tokens`), with the
   two data-plane hooks marked `=== DATA PLANE ===`.
 - `src/dataplane.rs` is the integration point: prefill **advertises** KV via
-  `kv_transfer_params`; decode **pulls** it. `NoopDataPlane` matches today's sim;
-  `NixlDataPlane` (behind the `nixl` feature) performs real NIXL transfers.
+  `kv_transfer_params`; decode **pulls** it. `NoopDataPlane` performs no transfer;
+  `NixlDataPlane` (behind the `nixl` feature) performs NIXL transfers.
 
 ## Status
 
-- **Protocol:** end-to-end. The vLLM Rust frontend serves streaming and
+- **Protocol:** implemented end-to-end. The vLLM Rust frontend serves streaming and
   non-streaming OpenAI completions through this backend over the ZMQ/msgpack
-  protocol, with real tokenizer/detokenizer and chat template, no GPU, no model
+  protocol, with tokenizer/detokenizer and chat template, no GPU, no model
   weights, no NIXL. Run `./scripts/e2e.sh`.
 - **Control plane (wire-compat):** the engine produces and consumes the vLLM
   NixlConnector `kv_transfer_params` schema
@@ -83,29 +82,30 @@ The protocol boundary is reused from vLLM's in-tree `vllm-engine-core-client` cr
   `remote_port`/`remote_block_ids`/`remote_request_id`/`tp_size`/`remote_num_tokens`),
   driven per-request. Exercised against a routing-sidecar emulation
   (`scripts/pd_control.sh`), no NIXL required.
-- **NIXL data plane:** the transfer mechanic is implemented and tested in-process
-  (`tests/nixl_loopback.rs`: register → NIXL READ → verify, Linux + libnixl).
-  Cross-pod pull over the ZMQ metadata side channel (the `get_meta_msg` handshake
-  serving `NixlAgentMetadata`) is the remaining increment; the addressing it needs
-  (`remote_host:remote_port:remote_engine_id`) is already produced and consumed.
+- **NIXL data plane:** the implemented path registers a paged KV pool on prefill,
+  serves a `PoolDescriptor` over a TCP metadata side channel, lets decode load the
+  remote metadata, and posts paged NIXL READs. `tests/nixl_loopback.rs` covers this
+  with distinct prefill/decode agents in one process over loopback (Linux + libnixl).
+  If NIXL initialization fails, the runtime logs a warning and falls back to
+  `NoopDataPlane`.
 
 ```bash
 ./scripts/pd_control.sh              # macOS: control-plane schema round trip
 cargo check --features nixl-stub     # macOS gate: typecheck the NIXL path
-cargo test  --features nixl          # Linux: real NIXL transfer
+cargo test  --features nixl          # Linux: NIXL transfer
 ```
 
 ## Quick start
 
-Default build (protocol only, no NIXL, runs anywhere):
+Default build (protocol only, no NIXL):
 
 ```bash
 cargo run -- --handshake-address tcp://127.0.0.1:29550 --log-requests
 ```
 
-Then point a real frontend at the same handshake address (see vLLM's
+Then point a vLLM frontend at the same handshake address (see vLLM's
 `rust/src/mock-engine/README.md` for the `vllm-rs serve` / `vllm serve` invocations;
-this binary is a drop-in for `vllm-mock-engine`).
+this binary uses the same handshake role as `vllm-mock-engine`).
 
 Smoke request once a frontend is up:
 
@@ -152,22 +152,32 @@ cargo check --features nixl-stub
 On Linux with NIXL installed, split a prefill and a decode engine:
 
 ```bash
-cargo run --features nixl -- --pd-role prefill ...
-cargo run --features nixl -- --pd-role decode  ...
+# prefill
+cargo run --features nixl -- --pd-role prefill \
+  --engine-id mock-prefill --side-channel-host 127.0.0.1 --side-channel-port 5600 ...
+
+# decode
+cargo run --features nixl -- --pd-role decode \
+  --engine-id mock-decode --side-channel-port 5601 ...
 ```
 
-## Hacking the engine
+The transfer path uses `remote_host`/`remote_port` from `kv_transfer_params` to fetch
+the prefill's `PoolDescriptor` over TCP, then issues NIXL READs for the advertised
+block ids. Decode receives those `remote_*` fields per request; the prefill address is
+not a decode CLI argument. The loopback test validates the byte-transfer path;
+Kubernetes deployment validation is separate.
 
-The engine is split along a trait boundary so you can swap behaviors without
-touching the core loop or the ZMQ transport.
+## Engine internals
+
+The engine separates loop orchestration from request behavior.
 
 **`EngineCore` (src/engine_core.rs)** is the top-level contract. The generic
 `run_loop` owns the tokio `select!` over inputs, internal events, and deadline
-ticks. Any struct implementing `EngineCore` plugs in unchanged. `SimEngine` is the
-production implementation; `ConstantEngine` (test-only, same file) is a from-scratch
-engine that reuses the loop.
+ticks. Any struct implementing `EngineCore` can use the loop. `SimEngine` is the
+production implementation; `ConstantEngine` (test-only, same file) is a minimal
+engine used by loop tests.
 
-**Three strategy traits on `SimEngine`** control its behavior without subclassing:
+**Three strategy traits on `SimEngine`** control request behavior:
 
 | Trait | File | Default | What it controls |
 |---|---|---|---|
@@ -177,10 +187,9 @@ engine that reuses the loop.
 
 Defaults are wired in `SimEngine::new` (from CLI flags) and in `run()`.
 
-**Contract tests** live in `tests/engine_core_e2e.rs`. They drive the full stack
-(real ZMQ, real protocol framing, real channels) and assert wire-level behavior. If
-your change breaks those tests, the wire protocol regressed. Unit tests in
-`src/engine.rs` cover engine internals at a finer grain.
+**Contract tests** live in `tests/engine_core_e2e.rs`. They drive ZMQ, protocol
+framing, and channels, then assert wire-level behavior. Unit tests in
+`src/engine.rs` cover engine internals.
 
 ## Trace replay and calibration
 
@@ -190,14 +199,14 @@ vs gate seeds).
 
 ### Concepts
 
-Three terms are used precisely throughout this section:
+This section uses three terms:
 
-- **Captured** — per-token tap recordings of a real engine, taken server-side on the
-  engine-core protocol. The "real" or "source" curve in every figure.
+- **Captured** — per-token tap recordings from a vLLM engine, taken server-side on
+  the engine-core protocol. Figures label these as "real" or "source".
 - **Modeled** — latency the simulator emits. TTFT and per-token gaps are drawn from a
   statistical model fitted to a captured trace (conditioned on concurrency, context
   depth, and uncached prompt size). Captured timings are not played back verbatim,
-  which lets a model fitted on one workload be evaluated on another.
+  so a model fitted on one workload can be evaluated on another.
 - **Direct replay** — recorded values used verbatim, no statistics: arrival
   timestamps (`--replay-arrivals`), session pacing (`--replay-sessions`), prefix
   structure (block hashes), and opt-in output token ids (`--replay-tokens`).
@@ -206,8 +215,9 @@ Three terms are used precisely throughout this section:
 replayed), not to the timing. Counterfactual gates fit on workload A, directly replay
 workload B's schedule, and check the modeled timing against B's capture.
 
-`just figures` rebuilds every figure in this section from the committed traces
-(`scripts/make_figures.sh`; ~30 minutes, the arrival replays run in real time). The
+`just figures` rebuilds the figures from local trace files listed in
+[traces/README.md](traces/README.md) (`scripts/make_figures.sh`; ~30 minutes, the
+arrival replays run in real time). Those trace files are not committed. The
 head-to-head comparison is the exception; it needs live serving stacks (commands in
 that section).
 
@@ -220,19 +230,19 @@ properties of the latency models:
 2. `KnobLatency` cannot reproduce heavy tails: its `[0.3*mean, 1.7*mean]` clamp caps
    p99/p50 at roughly 1.7x for any knob settings.
 
-This model-level check is meaningful for ITL and for TTFT on unloaded traces. On real
-loaded captures, the TTFT marginal comes from engine mechanics (queueing, chunk
-interference) rather than a sampled distribution, so its verdict can FAIL by design
-there; loaded TTFT is gated wire-level by the arrival-replay scenarios below.
+This model-level check applies to ITL and to TTFT on unloaded traces. On loaded
+captures, the TTFT marginal comes from queueing and chunk interference rather than a
+sampled distribution, so this check can fail by design. Loaded TTFT is checked by the
+arrival-replay scenarios below.
 
 ```bash
 # 1. Generate a synthetic heavy-tailed trace (lognormal TTFT/ITL).
 cargo run --bin inference-sim-trace -- gen-demo -o /tmp/demo.jsonl
 
-# 2. Model-level calibration (no transport, fast, exact).
+# 2. Model-level calibration (no transport).
 cargo run --bin inference-sim-trace -- calibrate /tmp/demo.jsonl
 
-# 3. Wire-level: spin the real simulator and measure client-side.
+# 3. Wire-level: start the simulator and measure client-side.
 cargo run --bin inference-sim-trace -- calibrate-e2e /tmp/demo.jsonl --requests 60
 ```
 
@@ -240,19 +250,18 @@ cargo run --bin inference-sim-trace -- calibrate-e2e /tmp/demo.jsonl --requests 
 (TTFT ~15-40ms, ITL ~3-10ms). All subcommands accept `--json` for machine-readable
 output and `--seed` for determinism.
 
-### Calibration against a real engine
+### Calibration with engine captures
 
 The recording tap (`inference-sim-tap`, deployment manifests in
 [deploy/trace-capture/](deploy/trace-capture/)) sits between the
-vLLM Rust frontend and a real headless vLLM engine (Qwen3-8B, TP=1, H200), recording
+vLLM Rust frontend and a headless vLLM engine (Qwen3-8B, TP=1, H200), recording
 per-token inter-token gaps server-side over in-pod localhost ZMQ.
 
 The figures below plot captured vs `TraceLatency` vs best-fit `KnobLatency` per-token
 ITL (survival curve and Q-Q plot), and the same trace as pooled per-token ITLs vs
-per-request mean ITLs (what client-side benchmark reports such as guidellm expose,
-since they record only first/last token timestamps). The knob model's
-`[0.3*mean, 1.7*mean]` clamp shows up as a vertical cutoff well short of the captured
-tail.
+per-request mean ITLs. Client-side benchmark reports such as guidellm usually expose
+per-request means because they record first/last token timestamps. The knob model's
+`[0.3*mean, 1.7*mean]` clamp appears as a vertical cutoff before the captured tail.
 
 ![Source vs replay vs knob-fit](docs/images/replay-fidelity.png)
 
@@ -268,18 +277,18 @@ uv run scripts/plot_calibration.py --samples samples.json --trace trace.jsonl --
 #### Comparison with llm-d-inference-sim
 
 Same workload (`deploy/trace-capture/loadgen.py`, concurrency 1 and 16, 512/128
-tokens) against three targets: the real H200 engine (tap-recorded), this simulator
-with its latency model fit from the canonical fitting set (a *different* workload, the
+tokens) against three targets: the H200 engine (tap-recorded), this simulator with its
+latency model fit from the canonical fitting set (a different workload, the
 counterfactual setting), and the Go
 [llm-d-inference-sim](https://github.com/llm-d/llm-d-inference-sim) (v0.9.1) with its
-latency knobs fit to this very trace (the in-sample setting). Both simulators ran
-natively on the same host, measured client-side by the same load generator; the
-real-engine curves are the tap recording. Both simulators' timing is modeled.
+latency knobs fit to the same trace (the in-sample setting). Both simulators ran on the
+same host and were measured client-side by the same load generator. The engine curves
+are the tap recording. Both simulators' timing is modeled.
 
 ![Real engine vs both simulators](docs/images/sim-comparison.png)
 
-The step model's mechanistic TTFT over-predicts this saturated fixed-concurrency
-workload by ~70ms at the median (an open calibration gap in the out-of-sample fit).
+The step model over-predicts TTFT for this saturated fixed-concurrency workload by
+~70ms at the median (a known calibration gap in the out-of-sample fit).
 The knob model clamps both tails by construction.
 
 Note: the trace's std-devs (TTFT 80ms, ITL 8ms) exceed llm-d-inference-sim's config
@@ -308,16 +317,16 @@ inference-sim --handshake-address tcp://127.0.0.1:5571 \
 The engine paces emission with a step clock that mirrors vLLM's per-step schedule:
 decodes claim the shared token budget first, prefills chunk into whatever remains (in
 admission order), and every co-running decode's gap is the composed step's duration.
-Chunk compute is fitted from the trace as a depth-dependent law (attention makes deep
+Chunk compute is fitted from the trace as a depth-dependent function (attention makes deep
 chunks cost more per token) plus a max-shape premium for budget-saturated steps; small
 chunks hide under the batch's decode compute. Queueing, chunk serialization, and decode
-elongation emerge from that composer rather than from interference knobs.
+elongation are produced by the step composer rather than by interference knobs.
 
 The gate is counterfactual: fit on one workload (a constant-load sweep plus a warm
 multiturn capture), then predict a cold-cache multiturn (~11k-token prompts, prefix
 caching disabled) the model never saw, whose prefill chunks continuously interfere with
-running decodes. The real engine spreads that as a two-shelf ITL band; the replay
-reproduces the band's shape, mass (13.9% vs 14.1%), and tail.
+running decodes. The capture shows a two-shelf ITL band; the replay reproduces the
+band's shape, mass (13.9% vs 14.1%), and tail.
 
 ![Counterfactual cold-multiturn replay](docs/images/step-model-counterfactual.png)
 
@@ -328,19 +337,19 @@ calibrated under the same model:
 
 ![Low-rate cold-multiturn replay](docs/images/step-model-lowrate.png)
 
-The same fit procedure refits from a Qwen3-30B-A3B (MoE) sweep with no constant
+The same fit procedure refits from a Qwen3-30B-A3B (MoE) sweep without constant
 changes and reproduces its counterfactual band.
 
 ### Open-loop arrival replay
 
-The calibrations above sample the latency model closed-loop, which validates the
-*distributions* but never stresses the reactive path: TTFT queueing, prefill stalls,
-and concurrency mixing only emerge when an arrival process drives the scheduler.
+The calibrations above sample the latency model closed-loop. That validates
+distributions, but it does not cover TTFT queueing, prefill stalls, or concurrency
+mixing from an external arrival process.
 `calibrate-e2e --replay-arrivals` direct-replays a captured arrival schedule in real
 time (each request sent at its recorded offset, open loop) and compares client-side
 TTFT/ITL/request-total quantiles against the capture. The arrivals are verbatim; every
 latency is still modeled. `--latency-trace` fits the sim's model from a *different*
-trace, so the gate runs on an arrival process the model was never fitted on.
+trace, so the gate runs on an arrival process outside the fitting set.
 
 Setup: the same frontend → tap → engine stack as the capture rig, run locally with
 `inference-sim` as the engine, its latency model fit from the canonical H200 fitting
@@ -359,9 +368,9 @@ concurrency-1 bucket, multiturn's is a warm-TTFT p99 where captured 103ms vs mod
 76ms differ by transport jitter the in-process replay does not model. Medians and p90s
 agree within ~1-2%, and request totals stay within 2.5%.
 
-The burst scenario is the harsher test: each burst floods an idle engine with 24
-simultaneous 512-token prefills, so TTFT is queueing-dominated (burst TTFT p50 1.2s /
-p99 2.0s vs poisson's 58ms / 150ms on the same config).
+The burst scenario sends 24 simultaneous 512-token prefills to an idle engine, so TTFT
+is queueing-dominated (burst TTFT p50 1.2s / p99 2.0s vs poisson's 58ms / 150ms on the
+same config).
 
 ![Burst arrival replay](docs/images/replay-arrivals-burst.png)
 
@@ -373,8 +382,8 @@ totals.
 
 Replayed prompts are unique-token synthetics: the captured workloads carry
 `cached_tokens: 0`, and identical fill tokens would silently turn every replayed
-request into a prefix-cache hit (this was a real bug). Workloads with genuine prefix
-reuse (multiturn/agentic) need the prefix structure replayed too, which is the next
+request into a prefix-cache hit. Workloads with prefix reuse (multiturn/agentic) need
+the prefix structure replayed too, which is the next
 scenario.
 
 To reproduce against any trace with `arrival_ms`:
@@ -400,29 +409,28 @@ prompt plus the model's response, on top of one of `--prefix-count` shared
 `--prefix-tokens` prefixes. The validation run below is ~100 sessions x 5 turns over
 two ~10k-token shared prefixes; 493 of 495 requests were prefix-cache hits.
 
-Prefix caching is not a latency knob here. The engine runs a real block-pool prefix
-cache; admission computes each request's actual cached-token count, the trace-fitted
-TTFT model conditions on the *uncached* prompt size, and a prefill admission stalls
-concurrent decodes by its uncached tokens only. The perf gain emerges from workload
-structure, which is why replaying it needs the workload's sharing structure: the tap
-fingerprints every prompt with chained per-block hashes (`block_hashes`,
-mooncake-style), and the replay expands each distinct hash to one deterministic token
-block, so replayed prompts share prefixes exactly where the captured ones did.
+Prefix caching is not a latency knob. The engine runs a block-pool prefix cache;
+admission computes each request's cached-token count, the trace-fitted TTFT model
+conditions on the uncached prompt size, and a prefill admission stalls concurrent
+decodes by its uncached tokens. Replaying prefix-cache workloads requires the workload's
+sharing structure. The tap fingerprints every prompt with chained per-block hashes
+(`block_hashes`), and replay expands each distinct hash to one deterministic token
+block. Replayed prompts therefore share prefixes at the same block boundaries as the
+capture.
 
 Two replay modes apply. Pure open-loop replay fires every turn at its recorded offset;
 `--replay-sessions` restores the generator's semantics (turn N+1 fires when turn N
 completes plus the recorded think gap; sessions are inferred from the hash chains).
-Session pacing is the honest mode for closed-loop agentic workloads, and it is what
-makes the cache-off what-if below meaningful: cold turns take seconds, so a session
-backs off the way the original client would have, where open-loop replay would fire
-every turn on the original warm schedule.
+Session pacing matches closed-loop client behavior: cold turns take seconds, so later
+turns are delayed by prior responses. Open-loop replay would fire every turn on the
+original warm schedule.
 
 The figure shows captured vs modeled TTFT survival per turn cohort (turn-1 requests:
 shared prefix hit only; turns 2+: growing context), plus the same schedule replayed
-with `--cold-prompts` (prefix reuse defeated). Without the cache, every turn
-re-prefills ~11k tokens and offered prefill load exceeds engine capacity: on turns 2+,
-TTFT p50 goes from 36ms to ~24s and p99 from 87ms to ~59s, even with closed-loop
-sessions backing off.
+with `--cold-prompts` (prefix reuse disabled). Without the cache, every turn
+re-prefills ~11k tokens and offered prefill load exceeds engine capacity. On turns 2+,
+TTFT p50 changes from 36ms to ~24s and p99 from 87ms to ~59s, with closed-loop
+sessions enabled.
 
 ![Multiturn cache effect](docs/images/multiturn-cache-effect.png)
 
@@ -433,58 +441,51 @@ uv run --with httpx deploy/trace-capture/loadgen.py --url http://127.0.0.1:8000 
   --prefix-tokens 6500 --prompt-tokens 128 --output-tokens 128 --duration 120 \
   --out run.json
 
-# session-paced replay (the gate), then the cache-off what-if
+# session-paced replay, then the cache-off replay
 cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
   --replay-arrivals --replay-sessions --latency-trace /tmp/fit.jsonl \
   --sim-arg=--kv-cache-size --sim-arg=65536 --dump-trace replay-measured.jsonl
 cargo run --release --bin inference-sim-trace -- calibrate-e2e tap-multiturn.jsonl \
   --replay-arrivals --replay-sessions --cold-prompts ... --dump-trace nocache-measured.jsonl
 
-# the per-cohort figure
+# per-cohort figure
 uv run scripts/plot_calibration.py --cache-effect real=tap-multiturn.jsonl \
   --cache-effect replay=replay-measured.jsonl --cache-effect nocache=nocache-measured.jsonl \
   --out-dir docs/images
 ```
 
-The chunk-cost law behind the cold numbers is the one the cold-multiturn counterfactual
-gate validates at this prompt scale, so the collapse is simulated queueing on validated
-per-chunk costs rather than an extrapolation. Mooncake-style workload traces (block-hash
-ids + lengths + timestamps) map directly onto this schema for replaying production
-workloads.
+The cold replay uses the chunk-cost model validated by the cold-multiturn
+counterfactual gate at this prompt scale. Workload traces with block-hash ids, lengths,
+and timestamps map onto this schema.
 
 ### Content-identical replay
 
-By default the trace schema is share-freely: timing, shapes, and prefix *structure*
-(block hashes), never tokens. Opting in with the tap's `--record-tokens` adds each
-request's `output_token_ids` (plus `finish_reason`, always recorded) to the trace.
-With the same tokenizer those ids decode back to the generated text, so such traces
-carry user content.
+By default, traces include timing, shapes, and prefix structure (block hashes), but not
+tokens. The tap's `--record-tokens` option adds each request's `output_token_ids` to
+the trace. `finish_reason` is always recorded. With the same tokenizer, recorded token
+ids decode back to generated text, so token-recording traces can contain user content.
 
 On the replay side, `inference-sim --replay-tokens <trace>` serves the recorded ids
 verbatim instead of random tokens, and ends each stream with the recorded finish
-reason. How a request finds its record is `--replay-match`:
+reason. `--replay-match` controls request-to-record matching:
 
 - `index` (default): the trailing `-<index>` of the request id, where the index is the
   record's position in the arrival-ordered schedule (the replay harness names requests
-  `replay-{i}`). Open-loop: only works when we generate the requests ourselves.
-  Combined with arrival replay this makes the simulated engine byte-identical to the
-  capture on the wire.
+  `replay-{i}`). This requires replay-generated request ids. Combined with arrival
+  replay, it reproduces the captured token stream on the wire.
 - `prefix`: the incoming prompt's chained block hashes are matched against the records'
   `block_hashes`, longest shared prefix wins, ties go to arrival order, and each record
   is consumed by its first match (a duplicate prompt takes the next duplicate record;
   once all are consumed, retries re-serve the best match). The matched stream ends where
   the capture did: the engine clamps the live request's `max_tokens` to the recorded
-  length. This is the closed-loop mode: a real client with its own request ids (an agent
-  loop re-run against the sim) gets back the captured streams, and because block hashes
-  are chained, noise at the tail of a prompt (a timestamp in the last tool output) only
-  shortens the match depth without changing which record wins.
+  length. This supports closed-loop clients with their own request ids, such as an agent
+  loop re-run against the simulator. Because block hashes are chained, a tail change in
+  a prompt shortens the match depth without changing earlier block matches.
 
-Unmatched requests fall back to random tokens in both modes. Together these give
+Unmatched requests fall back to random tokens in both modes. These modes provide
 deterministic streams for testing routers, EPPs, guardrails, and client SDK streaming
-behavior without a GPU; in prefix mode, for re-running an entire closed-loop agentic
-workload offline (each replayed response is byte-identical to the capture, so a
-deterministic agent reconstructs the same next prompt and the loop closes;
-`tests/closed_loop_prefix_replay.rs` exercises this shape).
+behavior without a GPU. Prefix mode can replay a closed-loop agentic workload offline
+when the agent is deterministic; `tests/closed_loop_prefix_replay.rs` covers this case.
 
 Every trace touchpoint (`--trace-out`, `--latency-trace`, `--replay-tokens`, trace
 conversion and replay harnesses) reads and writes gzip transparently when the path ends
@@ -493,57 +494,53 @@ compressing them is recommended.
 
 ### Replay pacing
 
-Content fidelity (`--replay-tokens`) and timing are independent axes, so pacing is knob
-composition rather than a mode switch:
+Content replay (`--replay-tokens`) and timing are configured independently:
 
 | Mode | Invocation |
 | --- | --- |
 | Timing-modeled | `--replay-tokens trace.gz --latency-trace trace.gz` plus scheduler args matching the capture (`--max-num-seqs`, `--max-num-batched-tokens`, ...): gaps and burst sizes sampled from a model fitted to the trace |
-| Timing-verbatim | `--replay-tokens trace.gz --replay-steps trace.gz`: each request replays its exact recorded per-chunk sizes and gaps (the fidelity ceiling; see the spec-decode section) |
+| Timing-verbatim | `--replay-tokens trace.gz --replay-steps trace.gz`: each request replays its recorded per-chunk sizes and gaps |
 | As fast as possible | `--replay-tokens trace.gz` and nothing else: all timing knobs default to 0, the instant model |
 | Compressed but shaped | `--replay-tokens trace.gz --latency-trace trace.gz --time-scale 100`: same interleavings and relative ordering, 100x faster wall clock |
 | Synthetic timing | `--replay-tokens trace.gz --time-to-first-token 50 --inter-token-latency 10` |
 
-Two knobs for the fast path: the scheduler still runs at zero delay (`--max-num-seqs`
-and the token budget produce real queueing and backpressure semantics at infinite
-speed; bump them for pure pass-through), and `--output-token-chunk-size` controls output
-framing if the client under test should also see multi-token chunks.
+For the fast path, scheduler limits still apply at zero delay. `--max-num-seqs` and the
+token budget control queueing and backpressure; increase them for pass-through replay.
+`--output-token-chunk-size` controls output framing.
 
 ### Speculative decoding and diffusion
 
-Speculative decoding (and diffusion, which vLLM serves through the same spec-decode
-block path) breaks the one-token-per-step assumption: a single engine step delivers a
-*burst* of tokens, 1 verified token plus the accepted drafts, or a whole diffusion
-block. The capture and replay path preserves that structure end to end.
+Speculative decoding and diffusion can emit multiple tokens from one engine step. A
+step can deliver one verified token plus accepted drafts, or a diffusion block. Capture
+and replay preserve this chunk structure.
 
 On the capture side the tap records, per output chunk, one `itl_ms` gap and the number
 of tokens that chunk delivered in a parallel `itl_tokens` array (omitted for plain
 autoregressive captures, so old traces are unchanged). The first chunk has no gap; its
 size is `output_tokens - sum(itl_tokens)`. With `--step-stats-out` the tap also writes
 a per-step `SchedulerStats` sidecar, which under speculative decoding carries
-`spec_decoding_stats` (per-position acceptance) straight off the real engine.
+`spec_decoding_stats` (per-position acceptance) from the vLLM engine.
 
-There are two ways to put that burst structure back on the wire:
+There are two replay modes for this structure:
 
 - **Modeled** (`--latency-trace`): the latency model draws the recorded `(gap, tokens)`
   pairs *jointly* from donor pools fitted to the capture. A step the capture saw deliver
   four tokens replays as one four-token message after a *sampled* gap, never four
-  messages at gap/4. It reproduces the burst *distribution* (so it transfers to a
-  workload it was not fit on), not any request's exact sequence, so expect small
-  sampling drift.
-- **Replay** (`--replay-steps`): each matched request emits its *own* recorded chunk
-  sizes at its own recorded gaps, bit-for-bit (the timing analogue of `--replay-tokens`;
-  requests resolve to records via `--replay-match`). This is the fidelity ceiling, exact
-  but non-transferable. Use it to validate the pipeline or to drive a downstream consumer
-  with a known-exact stream.
+  messages at gap/4. It reproduces the burst distribution, not an individual request's
+  recorded sequence, so sampling drift is expected.
+- **Replay** (`--replay-steps`): each matched request emits its recorded chunk sizes at
+  its recorded gaps (the timing analogue of `--replay-tokens`; requests resolve to
+  records via `--replay-match`). This mode replays recorded timing but does not
+  transfer to a different workload.
 
 Either way the simulator re-derives `spec_decoding_stats` from the bursts it emits
 (speculative budget `K = max(itl_tokens) - 1`, a burst of N tokens reported as 1 target
-token plus N-1 accepted drafts), so its scheduler stats line up with the capture's.
-Autoregressive traces report no spec stats, matching a real engine with speculation off.
+token plus N-1 accepted drafts), so its scheduler stats use the same structure as the
+capture. Autoregressive traces report no spec stats, matching a vLLM engine with
+speculation off.
 
 ```bash
-# 1. Capture: real engine with ngram spec decode behind the tap (writes
+# 1. Capture: vLLM engine with ngram spec decode behind the tap (writes
 #    tap-trace.jsonl + step-stats.jsonl). See deploy/trace-capture/ for manifests.
 just capture-up && bash deploy/trace-capture/run-capture.sh && just capture-down
 
@@ -567,11 +564,12 @@ The figure is the verbatim `--replay-steps` path (a 4096-record Qwen3-8B run; ng
 this workload accepts often, so ~45% of steps deliver the full 5 tokens). Left: tokens
 delivered per decode step, captured vs replayed. Middle: step time vs burst size;
 speculation verifies all K drafts in one target forward pass, so median step time is
-~flat in the burst size (~12ms whether the step delivered 1 or 5 tokens), and the dashed
-line is the ~gap/N a flattened replay would wrongly produce. Right: per-position draft
-acceptance read back from the `SchedulerStats` sidecar (pass a second
-`--spec-steps replay=...` to overlay the simulator's own emitted stats). Covered without
-a GPU by `tests/spec_replay_fidelity.rs` and `replay_steps`/engine unit tests.
+~flat in the burst size (~12ms whether the step delivered 1 or 5 tokens). The dashed
+line is the ~gap/N result that would appear if one chunk were split into N equal gaps.
+Right: per-position draft acceptance read back from the `SchedulerStats` sidecar (pass
+a second `--spec-steps replay=...` to overlay the simulator's own emitted stats).
+Covered without a GPU by `tests/spec_replay_fidelity.rs` and `replay_steps`/engine unit
+tests.
 
 ## Dependencies of note
 
@@ -579,7 +577,7 @@ a GPU by `tests/spec_replay_fidelity.rs` and `replay_steps`/engine unit tests.
   `Cargo.toml`). Bump the rev to track upstream protocol changes.
 - `nixl-sys` — pinned git dep on `ai-dynamo/nixl` (`rev` in `Cargo.toml`), the same
   source the image builds `libnixl` from, so the crate resolves identically on macOS
-  (stub) and in the container (real lib).
+  (stub) and in the container (native library).
 
 ## License
 

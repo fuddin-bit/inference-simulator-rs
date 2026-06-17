@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Rebuild every README/deck figure from the committed traces (traces/README.md
-# is the inventory). Run it as `just figures`.
+# Rebuild every README/deck figure from local trace files listed in
+# traces/README.md. Run it as `just figures`.
 #
 # The arrival replays run in REAL TIME (each one spins the actual simulator
 # and replays a captured schedule wall-clock), so the full set takes ~30

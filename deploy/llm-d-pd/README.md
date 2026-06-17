@@ -1,10 +1,10 @@
-# GPU-free llm-d P/D, end to end
+# GPU-free llm-d P/D deployment
 
-A self-contained, vendored copy of the llm-d v0.7.0 prefill/decode "well-lit path",
-repointed at the `inference-simulator-rs` image. It stands up the **real** llm-d control plane
-(Router/EPP, InferencePool, routing sidecar) in front of GPU-free model servers that run
-the **real** vLLM Rust frontend over our mock engine, and move KV across instances over
-**real NIXL/UCX on CPU**. No GPUs, no model weights, just a tokenizer.
+A self-contained copy of the llm-d v0.7.0 prefill/decode deployment, repointed
+at the `inference-simulator-rs` image. It stands up the llm-d control plane
+(Router/EPP, InferencePool, routing sidecar) in front of GPU-free model servers
+that run the vLLM Rust frontend over this simulator. The image includes libnixl
+and UCX for CPU NIXL transfers. No GPUs or model weights are required.
 
 ```
 client ─▶ Router/EPP ─▶ decode pod ─ routing-sidecar(nixlv2) ─┬─▶ prefill pod (vllm-rs + mock-engine, NIXL :5600)
@@ -51,7 +51,7 @@ kubectl run curl-debug --rm -it --image=cfmanteiga/alpine-bash-curl-jq --env="IP
     "model": "Qwen/Qwen3-0.6B", "prompt": "How are you today?", "max_tokens": 16 }' | jq
 ```
 
-Watch the data plane do its thing:
+Check data-plane logs:
 ```bash
 kubectl -n llm-d-pd-mock logs -l llm-d.ai/role=prefill -c modelserver | grep "advertised KV"
 kubectl -n llm-d-pd-mock logs -l llm-d.ai/role=decode  -c modelserver | grep "pulled remote KV"

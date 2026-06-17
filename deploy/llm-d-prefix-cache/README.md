@@ -1,6 +1,6 @@
 # Mock precise-prefix-cache-routing deployment
 
-A GPU-free stand-in for llm-d's **precise-prefix-cache-routing** well-lit path. A single
+A GPU-free stand-in for llm-d's **precise-prefix-cache-routing** deployment. A single
 pool of mock model servers (real vLLM Rust frontend + our mock engine) publish KV-cache
 events over ZMQ; the real llm-d Router (EPP) indexes them with `precise-prefix-cache-producer`
 and routes new requests to whichever pod already holds the longest matching prompt prefix.
