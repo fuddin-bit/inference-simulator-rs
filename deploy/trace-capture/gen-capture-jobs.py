@@ -104,6 +104,10 @@ def build_job(c: dict, lines: dict) -> dict:
     line = lines[tag]
     label_model = c["model"].split("/")[-1]  # k8s label can't hold the '/'
     sidecar = {"restartPolicy": "Always"}
+    # The tap/frontend image is a floating per-line tag (:vllm<line>); a node may
+    # cache a stale build under it, so force a re-pull. The engine is digest-pinned
+    # (immutable), so it keeps the default IfNotPresent.
+    floating = {**sidecar, "imagePullPolicy": "Always"}
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -165,7 +169,7 @@ def build_job(c: dict, lines: dict) -> dict:
                         },
                         {
                             "name": "tap",
-                            **sidecar,
+                            **floating,
                             "image": line["tap_image"],
                             "command": ["/usr/local/bin/inference-sim-tap"],
                             "args": tap_args(c),
@@ -178,7 +182,7 @@ def build_job(c: dict, lines: dict) -> dict:
                         },
                         {
                             "name": "frontend",
-                            **sidecar,
+                            **floating,
                             "image": line["tap_image"],
                             "command": ["/usr/local/bin/vllm-rs", "serve"],
                             "args": [
