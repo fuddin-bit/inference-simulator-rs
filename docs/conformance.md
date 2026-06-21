@@ -36,14 +36,38 @@ The capture stack records the real engine's wire traffic without changing it. Th
 processes run as sidecars, the load generator drives them, and the tap writes the
 trace:
 
-```
-loadgen (HTTP)            real vLLM engine (--headless, owns the GPU)
-    |                          ^
-    | /v1/...                  | ZMQ (engine handshake :5580)
-    v                          |
-vLLM frontend  --ZMQ-->  vllm-vcr record  (relays bytes verbatim, writes trace.jsonl)
- (vllm-rs serve)         frontend handshake :5570
-```
+<div class="vcr-flow vcr-flow-capture" role="img" aria-label="Load generator sends HTTP to the vLLM frontend, the recording tap proxies ZMQ between frontend and real engine, and the tap writes trace files.">
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">client</span>
+    <strong>loadgen</strong>
+    <span>HTTP workload</span>
+  </div>
+  <div class="vcr-connector"><span>OpenAI /v1</span></div>
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">frontend</span>
+    <strong>vLLM frontend</strong>
+    <span>vllm-rs serve</span>
+  </div>
+  <div class="vcr-connector"><span>ZMQ :5570</span></div>
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">tap</span>
+    <strong>vllm-vcr record</strong>
+    <span>relays frames verbatim</span>
+  </div>
+  <div class="vcr-connector"><span>ZMQ :5580</span></div>
+  <div class="vcr-node-stack">
+    <div class="vcr-node vcr-node-accent">
+      <span class="vcr-node-kicker">engine</span>
+      <strong>real vLLM</strong>
+      <span>--headless, owns GPU</span>
+    </div>
+    <div class="vcr-node vcr-node-artifact">
+      <span class="vcr-node-kicker">output</span>
+      <strong>trace.jsonl</strong>
+      <span>plus step-stats sidecar</span>
+    </div>
+  </div>
+</div>
 
 The engine runs `--headless` and binds the GPU. The tap dials the engine's
 handshake, the frontend dials the tap's handshake, so the tap sits on the wire
@@ -272,19 +296,44 @@ which is the normal state until captures exist. Set `$CONFORMANCE_MANIFEST` to p
 an alternate manifest. The pure assertions live in `src/conformance.rs` and are
 unit-tested independently of any real capture.
 
+The nightly canary is therefore a protocol-drift smoke until nightly captures exist,
+not a true fidelity gate: after pinning to live vLLM `main`, it runs the manifest
+runner for schema/provenance plumbing and also runs the HEAD-client protocol e2e
+tests (`engine_core_e2e` and `tap_e2e`) so a client-wire break still turns the run red.
+When a `line = "nightly"` golden is added, the canary detects it, assumes the same
+golden-fetch role as CI, and replays it before publishing the rolling prerelease.
+
 ## The GPU-free replay half
 
 The replay-many half needs no GPU anywhere. `deploy/trace-capture/offline-replay.yaml`
 runs the same python frontend with `vllm-vcr play` (not a real engine) in the engine
 slot, serving a captured trace with content-keyed matching:
 
-```
-agent (port-forward :8000)
-    | HTTP
-frontend  (vllm serve --data-parallel-size-local 0, no GPU)
-    | ZMQ
-sim       (vllm-vcr play --replay-tokens trace.jsonl --replay-match prefix)
-```
+<div class="vcr-flow vcr-flow-replay" role="img" aria-label="Agent talks HTTP to a GPU-free frontend, which connects over ZMQ to vllm-vcr play serving a captured trace.">
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">client</span>
+    <strong>agent</strong>
+    <span>port-forward :8000</span>
+  </div>
+  <div class="vcr-connector"><span>HTTP</span></div>
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">frontend</span>
+    <strong>vLLM frontend</strong>
+    <span>no local engine rank</span>
+  </div>
+  <div class="vcr-connector"><span>ZMQ</span></div>
+  <div class="vcr-node">
+    <span class="vcr-node-kicker">sim</span>
+    <strong>vllm-vcr play</strong>
+    <span>prefix-matched replay</span>
+  </div>
+  <div class="vcr-connector"><span>reads</span></div>
+  <div class="vcr-node vcr-node-artifact">
+    <span class="vcr-node-kicker">input</span>
+    <strong>captured trace</strong>
+    <span>JSONL or gzip</span>
+  </div>
+</div>
 
 The frontend MUST run the same model/tokenizer as the capture (prefix matching is on
 token ids), and stays on the protocol-pin image for the line. This is the same
@@ -302,7 +351,7 @@ under QEMU is unreliable (rustc SIGSEGVs under emulation). Build natively:
   `just image-build-line 0.22`: it pins `Cargo.toml` to that line's rev/fork with
   `cargo xtask pin-vllm`, stamps `VLLM_TARGET_VERSION`, and builds the vllm-rs frontend
   from the same source as the tap. (It leaves `Cargo.toml`/`Cargo.lock` rewritten;
-  `git checkout Cargo.toml Cargo.lock` to restore.)
+  restore those files after the build if you do not want to keep the local pin.)
 - On Apple Silicon, use the **build-on-waldorf** flow to build natively on the cluster
   with an unprivileged kaniko pod instead of cross-building locally.
 
