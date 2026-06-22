@@ -11,6 +11,7 @@ MANIFEST="${MANIFEST:-conformance/manifest.toml}"
 OUT_DIR="${OUT_DIR:-nightly-goldens}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-10800}"
+QUEUE_NAME="conformance-queue"
 
 timestamp() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -38,6 +39,66 @@ file_bytes() {
     wc -c < "$1" | tr -d '[:space:]'
 }
 
+capture_service_accounts() {
+    python3 - "${TARGETS}" <<'PY'
+import sys
+import tomllib
+
+targets = sys.argv[1].split()
+with open("deploy/trace-capture/models.toml", "rb") as f:
+    data = tomllib.load(f)
+
+defaults = data.get("defaults", {})
+captures = {c["name"]: c for c in data.get("capture", [])}
+accounts = []
+for target in targets:
+    capture = captures.get(target)
+    if not capture:
+        continue
+    account = capture.get("service_account", defaults.get("service_account"))
+    if account and account not in accounts:
+        accounts.append(account)
+
+print(" ".join(accounts))
+PY
+}
+
+validate_capture_matrix() {
+    python3 - "${TARGETS}" <<'PY'
+import sys
+import tomllib
+
+targets = sys.argv[1].split()
+with open("deploy/trace-capture/models.toml", "rb") as f:
+    models = tomllib.load(f)
+with open("compat.toml", "rb") as f:
+    compat = tomllib.load(f)
+
+captures = {c["name"]: c for c in models.get("capture", [])}
+defaults = models.get("defaults", {})
+selected = []
+missing = []
+for target in targets:
+    capture = captures.get(target)
+    if capture:
+        selected.append({**defaults, **capture})
+    else:
+        missing.append(target)
+
+if missing:
+    raise SystemExit(f"unknown capture target(s): {' '.join(missing)}")
+
+if any(c.get("vllm_tag") == "nightly" for c in selected):
+    nightly = next(v for v in compat["vllm"] if v["line"] == "nightly")
+    engine_image = models["lines"]["nightly"]["engine_image"]
+    if nightly["protocol_rev"] not in engine_image:
+        raise SystemExit(
+            "nightly engine_image must include compat.toml nightly protocol_rev "
+            f"{nightly['protocol_rev']}: {engine_image}"
+        )
+PY
+}
+
 on_error() {
     local status=$?
     local line="${1:-unknown}"
@@ -50,8 +111,53 @@ trap 'on_error ${LINENO}' ERR
 
 mkdir -p "${OUT_DIR}"
 
+if [[ ! "${NAMESPACE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+    log "ERROR: invalid Kubernetes namespace: ${NAMESPACE}"
+    exit 1
+fi
+
+validate_capture_matrix
+
 log "Starting nightly golden capture"
 log "Configuration: namespace=${NAMESPACE} targets=${TARGETS} manifest=${MANIFEST} out_dir=${OUT_DIR} poll=${POLL_SECONDS}s timeout=${TIMEOUT_SECONDS}s"
+
+group_start "Prepare namespace and queue"
+log "Ensuring namespace ${NAMESPACE} exists"
+kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+if ! kubectl get clusterqueue "${QUEUE_NAME}" >/dev/null 2>&1; then
+    log "ERROR: missing ClusterQueue ${QUEUE_NAME}; apply deploy/trace-capture/conformance-queue.yaml first"
+    exit 1
+fi
+
+log "Ensuring LocalQueue ${QUEUE_NAME} exists in namespace ${NAMESPACE}"
+cat <<YAML | kubectl apply -f -
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: ${QUEUE_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  clusterQueue: ${QUEUE_NAME}
+YAML
+
+for service_account in $(capture_service_accounts); do
+    if [[ ! "${service_account}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+        log "ERROR: invalid Kubernetes service account: ${service_account}"
+        exit 1
+    fi
+
+    log "Ensuring ServiceAccount ${service_account} exists in namespace ${NAMESPACE}"
+    cat <<YAML | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${service_account}
+  namespace: ${NAMESPACE}
+automountServiceAccountToken: false
+YAML
+done
+group_end
 
 group_start "Prepare validation scripts"
 log "Ensuring validation-scripts ConfigMap exists in namespace ${NAMESPACE}"
