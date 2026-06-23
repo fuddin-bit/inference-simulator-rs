@@ -17,11 +17,12 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
-use crate::trace::{ItlSummary, TraceMeta, TraceRecord, read_trace, write_trace};
+use crate::trace::{ItlSummary, TraceMeta, TraceRecord, TraceFinishReason, read_trace, write_trace};
 
 // guidellm JSON schema (minimal subset we actually use)
 
@@ -397,6 +398,232 @@ pub fn write_conversion(
     records: &[TraceRecord],
 ) -> Result<()> {
     write_trace(writer, meta, records)
+}
+
+// === Dataset (CSV/Parquet/JSON) → Trace conversion ===
+
+/// Sampling strategy for dataset conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplingStrategy {
+    Random,
+    Sequential,
+}
+
+/// Conversation structure in ShareGPT/similar datasets.
+#[derive(Debug, Deserialize)]
+struct GptConversation {
+    conversations: Vec<GptMessage>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GptMessage {
+    from: String, // "system", "human", "gpt", "user", "assistant"
+    value: String,
+}
+
+/// Convert a dataset file (CSV/Parquet/JSON) to trace JSONL format.
+///
+/// The dataset should contain conversations in ShareGPT-like format with a
+/// "conversations" field containing message arrays. Token counts are estimated
+/// using ~1.3 tokens/word heuristic, and random token IDs are generated.
+/// Latencies are left as placeholders (0) to be filled by runtime latency models.
+pub fn convert_dataset_to_trace(
+    input_path: &Path,
+    output_path: &Path,
+    sampling: SamplingStrategy,
+    vocab_size: u32,
+) -> Result<()> {
+    // Detect format by extension
+    let ext = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let conversations = match ext {
+        "csv" => parse_csv_dataset(input_path)?,
+        "json" | "jsonl" => parse_json_dataset(input_path)?,
+        "parquet" => parse_parquet_dataset(input_path)?,
+        _ => bail!(
+            "Unsupported dataset format: {} (supported: csv, json, jsonl, parquet)",
+            ext
+        ),
+    };
+
+    // Convert to TraceRecords
+    let mut rng = rand::rng();
+    let trace_records: Vec<TraceRecord> = conversations
+        .into_iter()
+        .filter_map(|conv| convert_conversation_to_trace(&conv, vocab_size, &mut rng).ok())
+        .collect();
+
+    if trace_records.is_empty() {
+        bail!("No valid conversations found in dataset");
+    }
+
+    // Apply sampling strategy
+    let sampled = apply_sampling(trace_records, sampling);
+
+    // Write as JSONL
+    let meta = TraceMeta {
+        model: Some("dataset-converted".to_string()),
+        ..Default::default()
+    };
+
+    let mut output = std::io::BufWriter::new(
+        std::fs::File::create(output_path)
+            .with_context(|| format!("creating output file: {}", output_path.display()))?,
+    );
+    write_trace(&mut output, &meta, &sampled)?;
+
+    Ok(())
+}
+
+fn convert_conversation_to_trace(
+    conv: &GptConversation,
+    vocab_size: u32,
+    rng: &mut impl rand::Rng,
+) -> Result<TraceRecord> {
+    // Extract prompt (messages before first "gpt"/"assistant" response)
+    let prompt_msgs: Vec<_> = conv
+        .conversations
+        .iter()
+        .take_while(|m| m.from != "gpt" && m.from != "assistant")
+        .collect();
+
+    // Extract response (first "gpt"/"assistant" message)
+    let response = conv
+        .conversations
+        .iter()
+        .find(|m| m.from == "gpt" || m.from == "assistant")
+        .with_context(|| "No assistant response found in conversation")?;
+
+    // Estimate token counts (~1.3 tokens/word)
+    let prompt_text = prompt_msgs
+        .iter()
+        .map(|m| m.value.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let prompt_tokens = estimate_tokens(&prompt_text);
+    let output_tokens = estimate_tokens(&response.value);
+
+    // Generate random output token IDs
+    let output_token_ids: Vec<u32> = (0..output_tokens)
+        .map(|_| rng.random_range(0..vocab_size))
+        .collect();
+
+    // Latencies as placeholders - filled by runtime latency model
+    Ok(TraceRecord {
+        prompt_tokens,
+        cached_tokens: 0,
+        output_tokens,
+        ttft_ms: 0.0,
+        itl_ms: None, // Will use latency model
+        itl_tokens: None,
+        itl_summary: None,
+        concurrency: 1,
+        arrival_ms: None,
+        itl_ctx: None,
+        block_hashes: None,
+        output_token_ids: Some(output_token_ids),
+        finish_reason: Some(TraceFinishReason::Stop),
+    })
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    // Rough approximation: ~1.3 tokens per word
+    (text.split_whitespace().count() as f64 * 1.3).ceil() as usize
+}
+
+fn apply_sampling(records: Vec<TraceRecord>, strategy: SamplingStrategy) -> Vec<TraceRecord> {
+    match strategy {
+        SamplingStrategy::Sequential => records,
+        SamplingStrategy::Random => {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::rng();
+            let mut shuffled = records;
+            shuffled.shuffle(&mut rng);
+            shuffled
+        }
+    }
+}
+
+fn parse_csv_dataset(path: &Path) -> Result<Vec<GptConversation>> {
+    let mut reader = csv::Reader::from_path(path)?;
+    let mut conversations = Vec::new();
+
+    for result in reader.deserialize() {
+        let conv: GptConversation = result?;
+        conversations.push(conv);
+    }
+
+    Ok(conversations)
+}
+
+fn parse_json_dataset(path: &Path) -> Result<Vec<GptConversation>> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+
+    // Try as array first
+    if let Ok(convs) = serde_json::from_reader::<_, Vec<GptConversation>>(reader) {
+        return Ok(convs);
+    }
+
+    // Try as JSONL (one per line)
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut conversations = Vec::new();
+
+    for line in std::io::BufRead::lines(reader) {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let conv: GptConversation = serde_json::from_str(&line)?;
+        conversations.push(conv);
+    }
+
+    Ok(conversations)
+}
+
+fn parse_parquet_dataset(path: &Path) -> Result<Vec<GptConversation>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use arrow::array::{Array, StringArray};
+
+    let file = std::fs::File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let reader = builder.build()?;
+
+    let mut conversations = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        let num_rows = batch.num_rows();
+
+        // Find the "conversations" column
+        let conversations_col = batch
+            .column_by_name("conversations")
+            .or_else(|| Some(batch.column(0)))
+            .with_context(|| "No conversations column found in Parquet file")?;
+
+        // Parse each row
+        for row_idx in 0..num_rows {
+            if let Some(string_array) = conversations_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+            {
+                if !string_array.is_null(row_idx) {
+                    let json_str = string_array.value(row_idx);
+                    let conv: GptConversation = serde_json::from_str(json_str)
+                        .with_context(|| format!("parsing conversation at row {}", row_idx))?;
+                    conversations.push(conv);
+                }
+            }
+        }
+    }
+
+    Ok(conversations)
 }
 
 #[cfg(test)]
