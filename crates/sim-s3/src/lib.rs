@@ -205,20 +205,28 @@ fn parse_hf_uri(uri: &str) -> Result<(String, String)> {
         );
     }
 
-    // Parse hf://org/repo/path/to/file.json
-    // The path should be: /org/repo/file or /org/repo/path/to/file
+    // URL parsing puts the first path segment in the host (`hf://org/repo/file` →
+    // host=org, path=/repo/file). Reassemble org/repo/.../file before splitting.
+    let mut segments: Vec<&str> = Vec::new();
+    if let Some(host) = url.host_str() {
+        if !host.is_empty() {
+            segments.push(host);
+        }
+    }
     let path = url.path().trim_start_matches('/');
-    let parts: Vec<&str> = path.splitn(3, '/').collect();
+    if !path.is_empty() {
+        segments.extend(path.split('/').filter(|segment| !segment.is_empty()));
+    }
 
-    if parts.len() < 3 {
+    if segments.len() < 3 {
         bail!(
             "HuggingFace URI must be hf://org/repo/file (got {})",
             uri
         );
     }
 
-    let repo = format!("{}/{}", parts[0], parts[1]);
-    let file = parts[2].to_string();
+    let repo = format!("{}/{}", segments[0], segments[1]);
+    let file = segments[2..].join("/");
 
     if file.is_empty() {
         bail!("HuggingFace URI has no file path: {uri}");
@@ -270,9 +278,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_remote_only_matches_s3_scheme() {
+    fn is_remote_matches_s3_and_hf_schemes() {
         assert!(is_remote("s3://bucket/key"));
         assert!(is_remote("S3://Bucket/Key"));
+        assert!(is_remote("hf://org/repo/file.json"));
         assert!(!is_remote("/tmp/trace.jsonl.gz"));
         assert!(!is_remote("trace.jsonl"));
         assert!(!is_remote("file:///tmp/trace.jsonl"));
@@ -352,9 +361,8 @@ mod tests {
         assert_eq!(
             uri,
             TraceUri::HuggingFace {
-                repo_id: "neuralmagic/vllm-traces".to_string(),
-                filename: "trace.jsonl.gz".to_string(),
-                revision: None,
+                repo: "neuralmagic/vllm-traces".to_string(),
+                file: "trace.jsonl.gz".to_string(),
             }
         );
         assert!(uri.is_remote());
@@ -362,24 +370,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_hf_uri_with_revision() {
-        let uri: TraceUri = "hf://org/repo@v1.2/data/file.json"
-            .parse()
-            .unwrap();
+    fn parses_hf_uri_with_nested_file_path() {
+        let uri: TraceUri = "hf://org/repo/data/file.json".parse().unwrap();
         assert_eq!(
             uri,
             TraceUri::HuggingFace {
-                repo_id: "org/repo".to_string(),
-                filename: "data/file.json".to_string(),
-                revision: Some("v1.2".to_string()),
+                repo: "org/repo".to_string(),
+                file: "data/file.json".to_string(),
             }
         );
-        assert_eq!(uri.to_string(), "hf://org/repo@v1.2/data/file.json");
+        assert_eq!(uri.to_string(), "hf://org/repo/data/file.json");
     }
 
     #[test]
     fn rejects_malformed_hf_uri() {
-        assert!("hf://repo".parse::<TraceUri>().is_err()); // no filename
-        assert!("hf://repo/".parse::<TraceUri>().is_err()); // empty filename
+        assert!("hf://repo".parse::<TraceUri>().is_err()); // no org/repo/file
+        assert!("hf://org/repo".parse::<TraceUri>().is_err()); // no file
     }
 }
