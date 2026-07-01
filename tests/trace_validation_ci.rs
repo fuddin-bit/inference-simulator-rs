@@ -17,7 +17,7 @@ use sim_trace::trace::read_trace_file;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig};
-use vllm_vcr::{run, Opt};
+use vllm_vcr::{Opt, run};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -38,10 +38,7 @@ async fn harness_with_replay(
     name: &str,
     replay_trace: &str,
 ) -> Result<(EngineCoreClient, SimGuard)> {
-    let addr = format!(
-        "ipc:///tmp/trace-val-{}-{name}.ipc",
-        std::process::id()
-    );
+    let addr = format!("ipc:///tmp/trace-val-{}-{name}.ipc", std::process::id());
 
     let args = vec![
         "play",
@@ -326,7 +323,10 @@ async fn validate_all_traces_parseable() -> Result<()> {
     for fixture in fixtures {
         let (meta, records) = read_trace_file(Path::new(fixture))?;
 
-        assert!(meta.model.is_some(), "fixture={fixture}: meta.model missing");
+        assert!(
+            meta.model.is_some(),
+            "fixture={fixture}: meta.model missing"
+        );
         assert!(!records.is_empty(), "fixture={fixture}: no records");
 
         // Validate each record passes validation
