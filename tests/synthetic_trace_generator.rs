@@ -27,6 +27,49 @@ pub fn generate_basic_trace(num_records: usize, seed: u64) -> (TraceMeta, Vec<Tr
     }
 }
 
+/// Hand-built trace for `--replay-tokens` E2E: two records with `arrival_ms` and
+/// `output_token_ids`, written in reverse arrival order so tests can prove index
+/// mapping uses canonical arrival ordering (same contract as `engine_core_e2e`).
+pub fn generate_token_replay_trace() -> (TraceMeta, Vec<TraceRecord>) {
+    let recorded_late: Vec<u32> = vec![900, 901, 902];
+    let recorded_early: Vec<u32> = vec![800, 801, 802, 803];
+    let meta = TraceMeta {
+        model: Some("synthetic-token-replay".to_string()),
+        source: Some("synthetic-e2e".to_string()),
+        ..Default::default()
+    };
+    // File order is late-then-early; replay_subset sorts by arrival_ms.
+    let records = vec![
+        TraceRecord {
+            prompt_tokens: 8,
+            output_tokens: recorded_late.len(),
+            ttft_ms: 1.0,
+            itl_ms: Some(vec![1.0; recorded_late.len() - 1]),
+            arrival_ms: Some(100.0),
+            output_token_ids: Some(recorded_late),
+            finish_reason: Some(TraceFinishReason::Length),
+            ..Default::default()
+        },
+        TraceRecord {
+            prompt_tokens: 8,
+            output_tokens: recorded_early.len(),
+            ttft_ms: 1.0,
+            itl_ms: Some(vec![1.0; recorded_early.len() - 1]),
+            arrival_ms: Some(0.0),
+            output_token_ids: Some(recorded_early.clone()),
+            finish_reason: Some(TraceFinishReason::Stop),
+            ..Default::default()
+        },
+    ];
+    (meta, records)
+}
+
+/// Recorded token vectors from [`generate_token_replay_trace`], in replay index order
+/// (`replay-0` = early arrival, `replay-1` = late arrival).
+pub fn token_replay_expected_ids() -> (Vec<u32>, Vec<u32>) {
+    (vec![800, 801, 802, 803], vec![900, 901, 902])
+}
+
 /// Generate a trace with batch context (itl_ctx) data.
 /// Simulates realistic batch interference with varying num_running and prefill_tokens.
 pub fn generate_batch_context_trace(
@@ -91,6 +134,7 @@ pub fn generate_batch_context_trace(
 
 /// Generate a speculative decoding trace with multi-token chunks (itl_tokens).
 /// Simulates EAGLE-style K=4 speculative decoding.
+#[allow(dead_code)]
 pub fn generate_speculative_trace(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceRecord>) {
     let mut rng = StdRng::seed_from_u64(seed);
     let meta = TraceMeta {
@@ -145,6 +189,7 @@ pub fn generate_speculative_trace(num_records: usize, seed: u64) -> (TraceMeta, 
 }
 
 /// Generate a diffusion model trace with block outputs (8-token bursts).
+#[allow(dead_code)]
 pub fn generate_diffusion_trace(num_records: usize, seed: u64) -> (TraceMeta, Vec<TraceRecord>) {
     let mut rng = StdRng::seed_from_u64(seed);
     let meta = TraceMeta {
@@ -193,6 +238,7 @@ pub fn generate_diffusion_trace(num_records: usize, seed: u64) -> (TraceMeta, Ve
 }
 
 /// Generate a trace with various edge cases.
+#[allow(dead_code)]
 pub fn generate_edge_cases_trace(_seed: u64) -> (TraceMeta, Vec<TraceRecord>) {
     let meta = TraceMeta {
         model: Some("synthetic-edge-cases".to_string()),
@@ -416,6 +462,7 @@ pub fn generate_arrival_schedule_trace(
 }
 
 /// Generate a trace with mixed concurrency levels.
+#[allow(dead_code)]
 pub fn generate_mixed_concurrency_trace(
     num_records: usize,
     seed: u64,

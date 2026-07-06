@@ -12,33 +12,20 @@ Full-stack integration tests using real ZMQ transport and `EngineCoreClient`. Te
 - LoRA lifecycle (when supported)
 - Prefill/Decode (P/D) handoff with KV transfer
 
-### 2. Synthetic E2E Tests (`engine_synthetic_e2e.rs`) ✨ NEW
-Comprehensive E2E tests using **programmatically generated synthetic traces**. Covers:
+### 2. Synthetic E2E Tests (`engine_synthetic_e2e.rs`)
+Three focused E2E tests over real ZMQ transport and `EngineCoreClient`:
 
-**Trace Schema Variants:**
-- Basic traces (simple prompt/output pairs)
-- Batch context traces (`itl_ctx` with interference patterns)
-- Speculative decoding traces (`itl_tokens` for multi-token chunks)
-- Diffusion model traces (block outputs)
+| Test | Mode | What it validates |
+|------|------|-------------------|
+| `test_basic_trace_latency_replay` | `--latency-trace` | Lognormal timing replay, token count completion |
+| `test_batch_context_latency_replay` | `--latency-trace` | `itl_ctx` schema + trace latency model |
+| `test_replay_tokens_serves_recorded_ids` | `--replay-tokens` | Exact token IDs, finish reasons, arrival ordering |
 
-**Edge Cases:**
-- Single-token outputs
-- Large outputs (1000+ tokens)
-- All finish reasons (Stop, Length, Abort, Error, Repetition)
-- High/low cache hit rates
-- Missing optional fields
+**Replay contract:**
+- `--latency-trace` needs timing fields only (`ttft_ms`, `itl_ms`, etc.); tokens are generated at runtime.
+- `--replay-tokens` requires `arrival_ms` on each record (for `replay_subset` ordering) and `output_token_ids` on at least one record. See `generate_token_replay_trace()` in `synthetic_trace_generator.rs`.
 
-**Replay Modes:**
-- Token replay (`--replay-tokens`)
-- Latency replay (`--latency-trace`)
-- Prefix matching (`--replay-match prefix`)
-- Compressed traces (`.jsonl.gz`)
-
-**Workload Patterns:**
-- Mixed concurrency levels (1, 4, 8, 16)
-- Varied prompt/output lengths
-- Arrival schedules for open-loop replay
-- Prefix sharing (multi-turn conversations)
+Token/content fidelity and protocol edge cases (abort, shutdown, P/D) live in `engine_core_e2e.rs`.
 
 ### 3. Real Trace Replay Tests
 Tests using actual GPU captures:
@@ -107,7 +94,7 @@ cargo test --test engine_synthetic_e2e -- --nocapture
 
 ### Run specific test
 ```bash
-cargo test --test engine_synthetic_e2e test_basic_trace_token_replay
+cargo test --test engine_synthetic_e2e test_replay_tokens_serves_recorded_ids
 ```
 
 ### Parallel execution control
@@ -119,20 +106,17 @@ cargo test --test engine_synthetic_e2e -- --test-threads=4
 ## Synthetic vs Real Traces
 
 ### Synthetic Traces (`engine_synthetic_e2e.rs`)
-**Purpose:** Fast, deterministic, comprehensive coverage of engine behavior
+**Purpose:** Fast, deterministic smoke tests for trace replay modes over real ZMQ
 
 **Characteristics:**
-- ✓ Generated programmatically with seeded RNG
+- ✓ Generated programmatically (seeded RNG or hand-built token replay trace)
 - ✓ No GPU or external dependencies required
-- ✓ Fast execution (<30 seconds for full suite)
-- ✓ Covers edge cases and schema variants systematically
+- ✓ Fast execution (three tests, typically under a few seconds)
 - ✓ CI-friendly (deterministic, parallel-safe)
 
 **When to use:**
-- Testing engine logic and replay modes
-- Validating schema support (batch context, speculative, diffusion)
-- Edge case coverage (single tokens, large outputs, all finish reasons)
-- Regression testing in CI
+- Validating `--latency-trace` and `--replay-tokens` wiring end to end
+- Regression testing trace schema fields used by the latency model (`itl_ctx`)
 
 ### Real Traces (`real_trace_replay.rs`, `conformance.rs`, etc.)
 **Purpose:** Validate fidelity against actual vLLM GPU captures
@@ -160,17 +144,12 @@ Shared utilities for engine tests:
 - `assert_*()` - Common assertions
 
 ### `synthetic_trace_generator.rs`
-Synthetic trace generation functions:
-- `generate_basic_trace()` - Simple traces with lognormal timing
-- `generate_batch_context_trace()` - Batch interference patterns
-- `generate_speculative_trace()` - Multi-token chunks (EAGLE-style)
-- `generate_diffusion_trace()` - Block outputs
-- `generate_edge_cases_trace()` - Edge cases collection
-- `generate_prefix_sharing_trace()` - Multi-turn conversations
-- `generate_mixed_concurrency_trace()` - Varying batch sizes
-- `generate_arrival_schedule_trace()` - Open-loop replay
+Synthetic trace generation functions used by E2E tests:
+- `generate_basic_trace()` - Simple traces with lognormal timing (`--latency-trace`)
+- `generate_batch_context_trace()` - Batch interference patterns (`itl_ctx`)
+- `generate_token_replay_trace()` - Hand-built trace with `arrival_ms` + `output_token_ids` for `--replay-tokens`
 
-All generators respect the `SYNTHETIC_E2E_FAST_MODE` environment variable for CI.
+Additional generators (speculative, diffusion, edge cases, etc.) remain available for fixtures and future tests. Latency generators respect `SYNTHETIC_E2E_FAST_MODE` for shorter TTFT/ITL in CI.
 
 ## Fast Mode (CI)
 
@@ -201,7 +180,7 @@ This is automatically enabled in GitHub Actions CI for faster builds while maint
        let (meta, records) = generate_my_trace(10, 12345);
        let trace_file = create_temp_trace("my_feature", &meta, &records)
            .expect("create trace");
-       let (client, _guard) = harness_with_trace("my_feature", trace_file.path(), &[/* flags */]).await;
+       let (client, _guard) = harness("my_feature", &["--latency-trace", trace_path]).await;
        // ... validate behavior
    }
    ```
@@ -213,35 +192,29 @@ This is automatically enabled in GitHub Actions CI for faster builds while maint
 
 ## Test Coverage Matrix
 
-| Trace Type | Token Replay | Latency Replay | Prefix Match | Compression | Edge Cases |
-|------------|--------------|----------------|--------------|-------------|------------|
-| Basic      | ✓            | ✓              | ✓            | ✓           | -          |
-| Batch Context | ✓         | ✓              | -            | -           | -          |
-| Speculative | ✓           | -              | -            | -           | ✓          |
-| Diffusion  | ✓            | -              | -            | -           | -          |
-| Edge Cases | ✓            | -              | -            | -           | ✓          |
-| Mixed Workload | ✓       | -              | -            | -           | -          |
+| Test | `--latency-trace` | `--replay-tokens` | Schema exercised |
+|------|-------------------|-------------------|------------------|
+| `test_basic_trace_latency_replay` | ✓ | - | Basic (gen_demo) |
+| `test_batch_context_latency_replay` | ✓ | - | `itl_ctx` |
+| `test_replay_tokens_serves_recorded_ids` | - | ✓ | `arrival_ms`, `output_token_ids` |
 
 ## CI Integration
 
-The synthetic E2E test suite runs in GitHub Actions as a separate job after `build-and-test`:
+Synthetic E2E tests can be run locally or in CI with fast timing:
 
-```yaml
-synthetic-e2e:
-  runs-on: ubuntu-latest
-  needs: build-and-test
-  env:
-    SYNTHETIC_E2E_FAST_MODE: "1"
+```bash
+SYNTHETIC_E2E_FAST_MODE=1 cargo test --test engine_synthetic_e2e
 ```
 
-See `.github/workflows/ci.yml` for full configuration.
+They are not yet wired into `.github/workflows/ci.yml`; `engine_core_e2e` covers the protocol contract in the default CI lane.
 
 ## Troubleshooting
 
 ### Tests hang or timeout
+- **`--replay-tokens` traces must include `arrival_ms` and `output_token_ids`**; missing fields cause the engine to fail after handshake and the client to hang until timeout.
 - Check for unique IPC endpoints (test name collision)
 - Verify no zombie simulator processes: `pkill -f inf-sim`
-- Increase `TIMEOUT` constant if tests are slow
+- Increase `TIMEOUT` constant if tests are slow (especially without `SYNTHETIC_E2E_FAST_MODE`)
 
 ### Flaky tests
 - Ensure tests use seeded RNG (deterministic)

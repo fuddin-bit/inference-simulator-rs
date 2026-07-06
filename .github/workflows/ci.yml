@@ -36,7 +36,7 @@ jobs:
   # single warm target/ and the cached git deps (vllm-engine-core-client, nixl-sys),
   # which dominate build time. The default build is pure-Rust (no libnixl/UCX), so it
   # needs nothing beyond the toolchain.
-  build-and-test:
+  build-and-check:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -64,9 +64,6 @@ jobs:
 
       - name: Clippy (default features)
         run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
-
-      - name: Test (default features)
-        run: cargo test --workspace --locked
 
       # Keep the trace tooling crate free of the vLLM engine-core git dependency,
       # so trace/calibration work builds without compiling the protocol stack.

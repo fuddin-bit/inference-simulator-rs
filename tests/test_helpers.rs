@@ -73,6 +73,7 @@ pub fn create_temp_trace(
 }
 
 /// Create a temporary gzip-compressed trace file.
+#[allow(dead_code)]
 pub fn create_temp_trace_gz(
     name: &str,
     meta: &TraceMeta,
