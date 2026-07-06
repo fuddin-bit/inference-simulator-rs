@@ -4,6 +4,6 @@
 # it automatically. Bump deliberately; this is distinct from the MSRV
 # (`rust-version = "1.85"` in Cargo.toml), which is the floor we promise to build on.
 [toolchain]
-channel = "1.95.0"
+channel = "1.85.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

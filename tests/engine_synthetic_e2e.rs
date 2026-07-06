@@ -131,8 +131,7 @@ async fn test_batch_context_latency_replay() {
 async fn test_replay_tokens_serves_recorded_ids() {
     let (meta, records) = generate_token_replay_trace();
     let (expected_early, expected_late) = token_replay_expected_ids();
-    let trace_file =
-        create_temp_trace("token_replay", &meta, &records).expect("create trace file");
+    let trace_file = create_temp_trace("token_replay", &meta, &records).expect("create trace file");
     let trace_path = trace_file.path().to_str().expect("path to UTF-8");
 
     let (client, _guard) = harness("token_replay", &["--replay-tokens", trace_path]).await;
@@ -146,12 +145,7 @@ async fn test_replay_tokens_serves_recorded_ids() {
         .expect("stream collect timed out");
     let tokens: Vec<u32> = outputs
         .iter()
-        .flat_map(|r| {
-            r.as_ref()
-                .expect("stream item error")
-                .new_token_ids
-                .clone()
-        })
+        .flat_map(|r| r.as_ref().expect("stream item error").new_token_ids.clone())
         .collect();
     assert_eq!(tokens, expected_early, "replay-0 serves the early arrival");
     assert_eq!(
@@ -169,12 +163,7 @@ async fn test_replay_tokens_serves_recorded_ids() {
         .expect("stream collect timed out");
     let tokens: Vec<u32> = outputs
         .iter()
-        .flat_map(|r| {
-            r.as_ref()
-                .expect("stream item error")
-                .new_token_ids
-                .clone()
-        })
+        .flat_map(|r| r.as_ref().expect("stream item error").new_token_ids.clone())
         .collect();
     assert_eq!(tokens, expected_late, "replay-1 serves the late arrival");
     assert_eq!(
