@@ -49,6 +49,12 @@ allow = [
     # Public-domain-equivalent, OSI-approved; pulled by a Windows-only zeromq
     # transitive (win_uds) we never actually build.
     "Unlicense",
+    # MPL-2.0: OSI-approved weak-copyleft, compatible with Apache-2.0/MIT dual
+    # licensing (used by option-ext, a transitive of hf-hub via dirs-sys).
+    "MPL-2.0",
+    # CDLA-Permissive-2.0: Permissive data-licensing (used by webpki-roots, a
+    # transitive of hf-hub via ureq for TLS root certificates).
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
@@ -66,6 +72,5 @@ unknown-git = "deny"
 # The git deps we pin on purpose (see compat.toml / Cargo.toml).
 allow-git = [
     "https://github.com/vllm-project/vllm.git",
-    "https://github.com/wseaton/vllm.git",
     "https://github.com/ai-dynamo/nixl.git",
 ]
