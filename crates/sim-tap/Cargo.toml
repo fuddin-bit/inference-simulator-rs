@@ -17,6 +17,8 @@ vllm-engine-core-client = { workspace = true }
 anyhow = { workspace = true }
 # Only for the TokenRecording ValueEnum that the record front-end parses.
 clap = { workspace = true }
+rmp-serde = "1.1"
+rmpv = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
