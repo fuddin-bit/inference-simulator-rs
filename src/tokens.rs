@@ -7,8 +7,9 @@
 //! streams content-identical to the capture. `HFDatasetTokens` loads a HuggingFace dataset
 //! in memory (via `--replay-tokens`) and serves tokenized responses, matching rows by
 //! request id or prompt block-hash prefix per `--replay-match`. Prompts and responses are
-//! tokenized with the HuggingFace model named by `--model-name` / `MODEL` (default
-//! `Qwen/Qwen3-0.6B`) so block-hash prefix matching aligns with the vLLM frontend.
+//! tokenized with the model named by `--model-name` / `MODEL` (required for datasets;
+//! accepts a HuggingFace model id or a local model directory) so block-hash prefix
+//! matching aligns with the vLLM frontend.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -262,19 +263,14 @@ impl TokenSource for PrefixMatchTokens {
     }
 
     fn next_tokens(&mut self, ctx: &TokenCtx<'_>, n: usize, rng: &mut StdRng) -> Vec<u32> {
-        let recorded = match self.record(ctx.request_id) {
-            Some(record) => {
-                let start = ctx.num_generated.min(record.token_ids.len());
-                let end = (ctx.num_generated + n).min(record.token_ids.len());
-                &record.token_ids[start..end]
-            }
-            None => &[],
+        let record = match self.record(ctx.request_id) {
+            Some(record) => record,
+            None => return self.fallback.next_tokens(ctx, n, rng),
         };
-        let mut tokens = recorded.to_vec();
-        if tokens.len() < n {
-            tokens.extend(self.fallback.next_tokens(ctx, n - tokens.len(), rng));
-        }
-        tokens
+        // Matched records never pad: admission clamps max_tokens via on_request_added.
+        let start = ctx.num_generated.min(record.token_ids.len());
+        let end = (ctx.num_generated + n).min(record.token_ids.len());
+        record.token_ids[start..end].to_vec()
     }
 
     fn on_request_finished(&mut self, request_id: &str) {
@@ -296,11 +292,16 @@ struct DatasetRow {
     response_tokens: Vec<u32>,
 }
 
-/// Default HuggingFace model id for tokenizing dataset rows when `--model-name` is unset.
-pub(crate) const DEFAULT_DATASET_TOKENIZER: &str = "Qwen/Qwen3-0.6B";
-
-/// Download and load a HuggingFace `tokenizer.json` for `model_id`.
+/// Load a tokenizer for `model_id`: if it's a local directory containing
+/// `tokenizer.json`, load from disk; otherwise download from HuggingFace Hub.
 fn load_hf_tokenizer(model_id: &str) -> Result<Tokenizer> {
+    let local = Path::new(model_id).join("tokenizer.json");
+    if local.is_file() {
+        info!(path = %local.display(), "loading dataset tokenizer from local path");
+        return Tokenizer::from_file(&local)
+            .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", local.display()));
+    }
+
     info!(
         model = model_id,
         "loading dataset tokenizer from HuggingFace"
@@ -493,7 +494,10 @@ impl HFDatasetTokens {
         warn!(
             request_id,
             prompt_blocks = chain.len(),
-            "no dataset row shares a prompt prefix; serving random tokens"
+            "no dataset row shares a prompt prefix; serving random tokens \
+             (dataset prompts are tokenized raw without a chat template / special \
+             tokens; frontend prompts usually include them, which breaks \
+             prefix-chained block hashes)"
         );
         None
     }
@@ -551,18 +555,13 @@ impl TokenSource for HFDatasetTokens {
 
         let pos = self.positions.get(ctx.request_id).copied().unwrap_or(0);
         let available = &row.response_tokens[pos.min(row.response_tokens.len())..];
-        let count = n.min(available.len());
+        let count = n.min(available.len());  //Limits the number of tokens to the number of tokens available in the row
 
-        let mut tokens = available[..count].to_vec();
+        // Matched rows never pad: admission clamps max_tokens via on_request_added.
+        let tokens = available[..count].to_vec();
 
-        // Update position
         if let Some(p) = self.positions.get_mut(ctx.request_id) {
             *p += count;
-        }
-
-        // Pad with fallback if we've exhausted the dataset row
-        if tokens.len() < n {
-            tokens.extend(self.fallback.next_tokens(ctx, n - tokens.len(), rng));
         }
 
         tokens
@@ -797,6 +796,23 @@ mod tests {
     }
 
     #[test]
+    fn prefix_match_does_not_pad_past_recorded_end() {
+        let (turn1, _, mut src) = prefix_records();
+        assert_eq!(src.on_request_added("live-abc", &turn1), Some(3));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let ctx = TokenCtx {
+            request_id: "live-abc",
+            prompt_token_ids: &turn1,
+            num_generated: 0,
+        };
+        // Record has 3 ids; asking for 5 must not invent a random tail.
+        assert_eq!(
+            src.next_tokens(&ctx, 5, &mut rng),
+            vec![100, 101, 102]
+        );
+    }
+
+    #[test]
     fn prefix_match_prefers_deepest_record() {
         // Turn 2's prompt also contains turn 1's chain as a prefix; the
         // deeper record must win, not the first indexed one.
@@ -993,5 +1009,26 @@ mod tests {
         let tokens = drain(&mut src, "replay-99", &prompt, 3);
         assert_eq!(tokens.len(), 3);
         assert!(tokens.iter().all(|&t| t < 50));
+    }
+
+    #[test]
+    fn hf_dataset_does_not_pad_past_row_end() {
+        use crate::ReplayMatch;
+        let prompt: Vec<u32> = (0..8).collect();
+        let rows = vec![DatasetRow {
+            prompt_token_ids: prompt.clone(),
+            block_hashes: crate::trace::prompt_block_hashes(&prompt, 4),
+            response_tokens: vec![10, 11, 12],
+        }];
+        let mut src = HFDatasetTokens::from_rows_for_test(rows, 4, 50, ReplayMatch::Index);
+        assert_eq!(src.on_request_added("replay-0", &prompt), Some(3));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let ctx = TokenCtx {
+            request_id: "replay-0",
+            prompt_token_ids: &prompt,
+            num_generated: 0,
+        };
+        // Row has 3 ids; asking for 5 must not invent a random tail.
+        assert_eq!(src.next_tokens(&ctx, 5, &mut rng), vec![10, 11, 12]);
     }
 }

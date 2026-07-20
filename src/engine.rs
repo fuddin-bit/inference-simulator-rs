@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::lora::{LoraSpec, request_lora_name};
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use rand::rngs::StdRng;
 use rand::{Rng as _, SeedableRng as _};
 use rmpv::Value as MsgpackValue;
@@ -1656,7 +1656,12 @@ impl SimEngine {
             side_channel_port: opt.side_channel_port + engine_index,
         };
         let latency: Box<dyn LatencyModel> = opt.build_latency()?;
-        let token_source: Box<dyn TokenSource> = opt.build_token_source()?;
+        let token_source: Box<dyn TokenSource> = tokio::task::spawn_blocking({   //Moves blocking work of build_token_source to a separate thread, this is used to avoid blocking the main thread when building the token source
+            let opt = opt.clone();
+            move || opt.build_token_source()
+        })
+        .await
+        .context("token source task panicked")??;
         let step_source: Option<Box<dyn StepSource>> = opt.build_step_source()?;
         // Verbatim replay carries its own burst budget; otherwise the modeled
         // latency model reports K. Either source emits spec_decoding_stats.

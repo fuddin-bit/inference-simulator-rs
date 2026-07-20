@@ -131,9 +131,9 @@ pub struct Opt {
     ///
     /// Also accepts HuggingFace-style dataset files (JSON/JSONL/CSV/Parquet): the
     /// dataset is loaded in memory at startup, prompts and responses are tokenized
-    /// with the HuggingFace model named by `--model-name` / `MODEL` (default
-    /// [`tokens::DEFAULT_DATASET_TOKENIZER`]), and output tokens are served directly
-    /// via [`tokens::HFDatasetTokens`] — no trace conversion.
+    /// with the HuggingFace model named by `--model-name` / `MODEL` (required for
+    /// datasets), and output tokens are served directly via
+    /// [`tokens::HFDatasetTokens`] — no trace conversion.
     #[arg(long)]
     pub replay_tokens: Option<TraceUri>,
 
@@ -321,10 +321,10 @@ pub struct Opt {
     #[arg(long, default_value = "")]
     pub kv_events_topic: String,
 
-    /// Served model name: builds the default KV-event topic and tokenizes HuggingFace
-    /// dataset rows for `--replay-tokens` (defaults to [`tokens::DEFAULT_DATASET_TOKENIZER`
-    /// when unset).
-    #[arg(long, env = "MODEL", default_value = "")]
+    /// Served model name (HuggingFace model id or local model directory): builds the
+    /// default KV-event topic and tokenizes HuggingFace dataset rows for
+    /// `--replay-tokens` (required when the replay file is a dataset).
+    #[arg(long, env = "MODEL", default_value = "")]   // env = "MODEL" is the environment variable that is used to set the model name, this is used to set the model name for the HuggingFace model
     pub model_name: String,
 
     /// Fixed seed chaining the first block of every sequence's hash (vLLM's `NONE_HASH`).
@@ -400,12 +400,15 @@ impl Opt {
     }
 
     /// HuggingFace model id used to tokenize dataset rows for `--replay-tokens`.
-    pub(crate) fn dataset_tokenizer_model(&self) -> &str {
+    /// Requires `--model-name` to be set explicitly.
+    pub(crate) fn dataset_tokenizer_model(&self) -> Result<&str> {
         if self.model_name.is_empty() {
-            tokens::DEFAULT_DATASET_TOKENIZER
-        } else {
-            &self.model_name
+            bail!(
+                "--model-name (or MODEL env) is required when --replay-tokens \
+                 points to a dataset file"
+            );
         }
+        Ok(&self.model_name)
     }
 
     /// Build the KV-cache event publisher config for one engine. The endpoint port and the
@@ -464,7 +467,7 @@ impl Opt {
                 path,
                 self.tokens_per_block,
                 self.replay_match,
-                self.dataset_tokenizer_model(),
+                self.dataset_tokenizer_model()?,
             )?));
         }
 
@@ -939,5 +942,35 @@ mod tests {
             .to_string();
         assert!(err.contains("no config_hash"), "got: {err}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn dataset_tokenizer_model_requires_model_name() {
+        let opt = Opt::parse_from(["play"]);
+        let err = opt.dataset_tokenizer_model().unwrap_err().to_string();
+        assert!(err.contains("--model-name"), "got: {err}");
+    }
+
+    #[test]
+    fn dataset_tokenizer_model_returns_model_name() {
+        let opt = Opt::parse_from(["play", "--model-name", "org/model"]);
+        assert_eq!(opt.dataset_tokenizer_model().unwrap(), "org/model");
+    }
+
+    #[test]
+    fn build_token_source_dataset_without_model_name_errors() {
+        let dir = std::env::temp_dir().join(format!("sim-ds-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.join("data.json");
+        std::fs::write(&ds, r#"[{"instruction":"hi","output":"hello"}]"#).unwrap();
+
+        let opt = Opt::parse_from([
+            "play",
+            "--replay-tokens",
+            ds.to_str().unwrap(),
+        ]);
+        let err = opt.build_token_source().err().expect("should fail without --model-name").to_string();
+        assert!(err.contains("--model-name"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

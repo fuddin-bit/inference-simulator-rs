@@ -156,7 +156,7 @@ impl TraceUri {
 
         // Download using hf-hub async API
         let api = Api::new().map_err(|e| anyhow::anyhow!("initializing HF API: {}", e))?;
-        let repo_api = api.model(repo.to_string());
+        let repo_api = api.dataset(repo.to_string());   // api.dataset(repo.to_string()) is the HuggingFace API endpoint for the dataset
         let local_path = repo_api
             .get(filename)
             .await
